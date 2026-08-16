@@ -8,8 +8,6 @@ metadata:
   namespace: tmp-crdb-krb5
   labels: {app: loadgen}
 spec:
-  imagePullSecrets:
-    - {name: regcred}
   securityContext:
     runAsNonRoot: true
     runAsUser: 1000
@@ -18,7 +16,7 @@ spec:
     seccompProfile: {type: RuntimeDefault}
   containers:
     - name: loadgen
-      image: registry-tmp-crdb.owo.me/kdc:v3
+      image: hub.generalprogramming.org/erinpublic/kdc:e52f869
       command: ["/bin/sh", "-c", "sleep infinity"]
       env:
         - {name: KRB5_CONFIG, value: /config/krb5.conf}

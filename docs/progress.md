@@ -652,3 +652,38 @@ lone us-west-2 survivor is an unrelated 2021-era t4g.micro). Repo now
 public at https://github.com/nepeat/vibeslop_krb5_kdb_crdb (HTTPS
 remote — no GitHub SSH key on this box). Registry images:
 hub.generalprogramming.org/erinpublic/kdc {latest, e52f869} multi-arch.
+
+## 2026-08-16: sea1 moved to hub image; kadmin safety suite (24/24)
+
+sea1 kdc/kadmind/loadgen now run hub.generalprogramming.org/erinpublic/
+kdc:e52f869 (public, multi-arch — regcred imagePullSecrets dropped).
+First real exercise of kadmind RPC found a LATENT bug: MIT kadmind
+ignores kadmind_port in the realm stanza (kpasswd_port IS honored) and
+binds 749 — the Service's targetPort 8749 pointed at nothing since day
+one; every prior write went through kadmin.local. Service now targets
+749 (Talos allows unprivileged low ports; noted in kdc.yaml).
+
+New k8s/kadmin-safety-test.sh (run from dev box, SQL asserts via
+port-forward + local cockroach): 24/24 PASS on the hub image —
+- 32 concurrent disjoint creates: all acked, authable, SQL-consistent.
+- 16-way cpw storm on one principal: exactly one winning password,
+  kvno consistent. create/delete flap x10: DB row always agrees with
+  authability.
+- entry_cache_ms=1000 staleness bounds: cpw, delprinc, and -allow_tix
+  visible on ALL 3 KDCs within TTL+500ms slack (in-window stale hits
+  0/3 this run; allowed by design).
+- FULL split brain: kadmin write refused (no false ack). The refused
+  write committed AFTER heal with its ack lost — fully formed and
+  authable; suite calls this out as ack-loss-not-data-loss, our
+  documented semantics. Single-node partition: write succeeds via the
+  plugin's multi-host gateway failover.
+- kadmind pod killed mid-batch (52/64 true acks via reply text — NB
+  kadmin -q exits 0 on mid-RPC death, exit codes are NOT acks): zero
+  acked writes lost, zero torn rows.
+- Audit: principal count back to baseline 262,150; no orphan aliases;
+  no container crashes.
+
+Known seam: kadmin's client-side timeout means "refused" during a
+partition can still commit later (standard exactly-once-ack problem);
+operators should treat timed-out kadmin writes as indeterminate and
+re-check with getprinc, not blind-retry addprinc -pw.

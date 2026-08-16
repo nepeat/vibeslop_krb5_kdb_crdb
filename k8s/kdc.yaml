@@ -1,7 +1,8 @@
 # 3 KDCs on the kdb_crdb backend, one per sea1 metal node (required
-# anti-affinity), plus one kadmind. Image is the nix closure built by the
-# dev box (registry-tmp-crdb.owo.me/kdc). Unprivileged: KDC listens on
-# 8888, Service maps 88 -> 8888.
+# anti-affinity), plus one kadmind. Image is the flake's kdc-image
+# (`just image-push` -> hub.generalprogramming.org/erinpublic/kdc,
+# public, multi-arch). Unprivileged: KDC listens on 8888, Service maps
+# 88 -> 8888.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -26,6 +27,9 @@ data:
             database_module = crdb
             acl_file = /config/kadm5.acl
             key_stash_file = /secrets/stash/master.stash
+            # NB: MIT kadmind IGNORES kadmind_port here and binds 749
+            # (kpasswd_port IS honored). Service targets 749 directly;
+            # the node allows unprivileged low ports.
             kadmind_port = 8749
             kpasswd_port = 8464
             max_life = 10h 0m 0s
@@ -72,8 +76,6 @@ spec:
     metadata:
       labels: {app: kdc}
     spec:
-      imagePullSecrets:
-        - {name: regcred}
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -88,7 +90,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: krb5kdc
-          image: registry-tmp-crdb.owo.me/kdc:v5
+          image: hub.generalprogramming.org/erinpublic/kdc:e52f869
           # Workers are DB-latency-bound, not CPU-bound: oversubscribe.
           command: ["krb5kdc", "-n", "-w", "48"]
           env:
@@ -138,8 +140,6 @@ spec:
     metadata:
       labels: {app: kadmind}
     spec:
-      imagePullSecrets:
-        - {name: regcred}
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -148,13 +148,13 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: kadmind
-          image: registry-tmp-crdb.owo.me/kdc:v5
+          image: hub.generalprogramming.org/erinpublic/kdc:e52f869
           command: ["kadmind", "-nofork"]
           env:
             - {name: KRB5_CONFIG, value: /config/krb5.conf}
             - {name: KRB5_KDC_PROFILE, value: /config/kdc.conf}
           ports:
-            - {containerPort: 8749, protocol: TCP, name: kadmin}
+            - {containerPort: 749, protocol: TCP, name: kadmin}
             - {containerPort: 8464, protocol: UDP, name: kpasswd}
           resources:
             requests: {cpu: "1", memory: 512Mi}
@@ -199,5 +199,5 @@ metadata:
 spec:
   selector: {app: kadmind}
   ports:
-    - {name: kadmin, port: 749, targetPort: 8749, protocol: TCP}
+    - {name: kadmin, port: 749, targetPort: 749, protocol: TCP}
     - {name: kpasswd, port: 464, targetPort: 8464, protocol: UDP}
