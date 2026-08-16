@@ -537,3 +537,56 @@ Committed in layers: vendored kurbu5 + patches, core plugin, e2e suite +
 compose, k8s/sea1 + image-build, terraform + ansible, docs. Next
 concrete step is unchanged from HANDOFF.md: redo the AWS 3-region read
 burn, then upstream the two kurbu5 patches.
+
+## 2026-08-16: KDC deployment containerized — nix image + ansible quadlets
+
+The flake now builds release artifacts, not just the dev shell:
+- `nix build .#kdb-crdb` — the plugin via buildRustPackage (cargoLock
+  works with zero pinned hashes because kurbu5 is [patch]ed to the
+  in-tree vendor/, no git deps in the lockfile; bindgenHook replaces the
+  manual LIBCLANG/BINDGEN env from the dev shell; cdylib lands in
+  result/lib with nix-store rpaths — ldd-verified openssl resolution).
+- `nix build .#kdc-image` — dockerTools.buildLayeredImage,
+  localhost/kdc:latest, 29MB compressed (vs the 139MB hand-copied
+  rootfs). krb5 1.22.2 + bash/coreutils/grep/gawk + tgsbench (now a
+  flake package built from e2e/tgsbench.c) + /opt/kdb/kdb_crdb.so, plus
+  a real /etc/passwd (kills the `kadmin.local -p` gotcha from kdc:v3).
+  /config and /secrets are mount points; the image carries no realm
+  state, runs as root under podman, uid-agnostic for k8s (1000).
+  image-build/ (Dockerfile + rootfs assembly) is retired/deleted.
+
+Ansible got the Kerberos layer it never had (README said "wire KDCs by
+hand afterwards" — no more):
+- roles/kdc_node: podman via apt, image built on the CONTROLLER by nix
+  (arch-mapped per host; kdc_image_tar override for cross-arch fleets),
+  shipped as a tarball over SSH (no registry needed), podman-loaded,
+  run as host-network quadlet units (krb5kdc everywhere, kadmind on the
+  admin host; ReadOnly=true + Tmpfs=/tmp). kdc.conf is templated with
+  ONLY region-local CRDB nodes (crdb_region hostvar match) using the
+  crdb_certs client certs. Handlers are try-restart on purpose: inert
+  until first start, so config pushes can't crash-loop a stashless KDC.
+- roles/kdc_init (admin host, idempotent): master/admin passwords via
+  lookup('password') into ansible/secrets/, `kdb5_util create -s` in
+  the container through the plugin, stash banked controller-side and
+  distributed; admin principal created if missing.
+- site.yml: three new plays (kdc / kdc-init / kdc-verify tags), serial:1,
+  ending in a per-node in-container kinit smoke test. render-test.yml
+  renders kdc.conf + quadlet offline — verified region selection picks
+  only sea1 nodes for a sea1 KDC. Inventory example + group_vars/kdc.yml
+  added; terraform now renders a [kdc] group (first node per region) and
+  the SG opens 88/464(tcp+udp)+749(tcp) mesh-internal.
+
+Verification done on this box: ansible --syntax-check (site, render-test,
+upgrade) clean; render-test output inspected; tofu validate clean; image
+built + docker-loaded, all daemons present; and the containerized
+kadmin.local ran `listprincs` against the LIVE compose cluster through
+the nix-built plugin (TLS client-cert auth, stash read) — full realm
+listing returned. Not yet run against real remote hosts: the AWS read
+burn redo is the natural first live exercise (HANDOFF step 1 now needs
+no manual KDC wiring — site.yml does it).
+
+Known seams: kdc_init can't recover a realm whose stash is lost
+everywhere (deliberate — runbook path is `kdb5_util stash` with the
+banked master password); k8s/ still uses its own registry push flow
+(point it at `nix build .#kdc-image` + skopeo next time the sea1 rig is
+touched).
