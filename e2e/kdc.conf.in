@@ -31,6 +31,9 @@
         entry_cache_ms = 1000
         # Degraded-read fallback (KDC role only): when CRDB loses quorum,
         # serve auth from bounded-staleness follower reads up to this old.
+        # Doubles as the outage budget — the resolved timestamp freezes at
+        # quorum loss, so reads stop being satisfiable ~this long after it
+        # and auth fails closed (e2e/staleness-bound.sh measures both).
         stale_reads_ms = 30000
     }
 

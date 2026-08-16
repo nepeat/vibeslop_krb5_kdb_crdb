@@ -62,6 +62,14 @@ schema.sql      multi-region DDL, GLOBAL tables, optional lockout side table
         # by any surviving replica: the realm keeps issuing tickets
         # through node loss and even a full split brain, at most this
         # many ms stale. Writes still (correctly) require quorum.
+        # This is ALSO the outage budget, not just a staleness bound:
+        # the local resolved timestamp freezes the moment quorum goes,
+        # so CockroachDB stops being able to satisfy the read about
+        # this many ms later and auth then fails closed rather than
+        # serving anything older (measured on the compose cluster:
+        # 30000 -> auth held 30.9s, 10000 -> 10.5s; see
+        # e2e/staleness-bound.sh). Size it against how long you expect
+        # to need to restore quorum.
         # For multi-node failover, list every local CRDB node in
         # connection_uri (host1:26257,host2:26257,...) — the plugin
         # rotates the order per process and walks the list on reconnect.
