@@ -961,3 +961,102 @@ whose output belongs here.
 - Once the staleness bound lapses, the surviving node's SQL layer starts
   failing everything with `replica unavailable ... r33:/NamespaceTable`
   — not just the principals range; the whole session becomes useless.
+
+## 2026-08-16 (later): cold-start resilience — KDC restarts through a
+## TOTAL CRDB outage (startup_retry_ms + offline last-known-good cache)
+
+Premise (established before any code, do not re-litigate): a NEW SQL
+session to a quorum-less CRDB node is architecturally impossible —
+session setup writes (sqlliveness, descriptor leasing). So `stale_reads_ms`
+only ever covered a process that KEEPS its existing session; a KDC that
+restarts mid-outage (power loss, rolling reboot, OOM kill) had nothing to
+read, and `Store::connect` being eager at open() meant it exited and
+crash-looped.
+
+**Two new capabilities, three new knobs, all opt-in and default-off.**
+
+- **`startup_retry_ms`** (all roles, default 0 = the old fail-fast).
+  `store.rs::open_client_retrying`: capped backoff 250ms doubling to 2s
+  until the budget lapses. The same routine, budget capped at 2s
+  (`REQUEST_RETRY_CAP_MS`), covers per-request reconnects, and a second
+  circuit breaker (`connect_hold_until`, 5s) means an outage costs ONE
+  connect attempt per 5s window per worker instead of one per request.
+  The connection is now LAZY (`conn: Mutex<Option<Conn>>`) — that is what
+  lets open() succeed with no database at all. Multi-host walk unchanged
+  (rust-postgres re-walks the rotated list on every attempt).
+- **`offline_cache_path` + `offline_cache_max_age_ms`** (KDC role ONLY,
+  both or neither — one alone is EINVAL). New `src/offline.rs`: raw wire
+  blobs exactly as stored in `principals`, plus the `aliases` rows a
+  lookup needed, plus a monotone written-at stamp, postcard-serialized to
+  a 0600 file via tmp+write+fsync+rename+dir-fsync. Fed only by
+  successful KDC-role reads. Flushes ride the request flow (NO background
+  thread): first change written straight through — krb5kdc reads K/M
+  before it will listen, and that entry is what makes a cold start
+  possible at all — then at most once per 10s. `-w N` workers share the
+  path and MERGE newest-stamp-wins on flush, so they converge on the
+  union of what the fleet read instead of clobbering each other. Corrupt/
+  truncated/wrong-version/unreadable file = log + start empty, never an
+  open() failure. 16k entry cap, oldest stamps pruned.
+
+**The error-semantics decision (the one worth reviewing).** An offline
+MISS or an entry past max age returns `KRB5KDC_ERR_SVC_UNAVAILABLE`
+(Custom(-1765328355)), never `NoEntry`. The cache is partial by
+construction, so NoEntry would let it manufacture a false
+KDC_ERR_C_PRINCIPAL_UNKNOWN for a principal that exists. The KDC passes
+protocol-range codes straight through, so this is client-visible as
+exactly the right thing — measured in the e2e:
+`kinit: A service is not available that is required to process the
+request while getting initial credentials`. `store::is_unavailable` lets
+lib.rs still chase the alias table on an offline direct miss (the cache
+keeps alias rows), and any miss anywhere in that chain stays an error
+while offline instead of collapsing to Ok(None).
+
+Layering unchanged in front: entry_cache (1s TTL) → primary read →
+bounded-stale read → offline cache. Writes never touch it, admin roles
+never read it, misses are never cached.
+
+**e2e/cold-start.sh** (new; step 8 of full-cycle.sh) — warm cache →
+`docker compose stop` ALL THREE nodes → restart krb5kdc (-w 1) into the
+dead cluster → assert auth from cache → assert writes AND uncached
+lookups fail with the right errors → age out → heal → converge. Results
+on the compose cluster, exit 0:
+
+| measurement | value |
+|---|---|
+| warm cache after 2 kinits + 1 kvno | 945 bytes, 0600, 4 entries (K/M, krbtgt, cold-user, host/h0001) |
+| krb5kdc listening with NO database | 3.64 s (3000ms budget, paid by supervisor then worker) |
+| **cold start -> first ticket** | **7.13 s** |
+| uncached principal offline | `A service is not available…` (NOT "does not exist") |
+| kadmin write offline | refused |
+| max_age unsatisfiable | krb5kdc refuses to start ("cannot initialize realm") — fail closed at the K/M read |
+| heal -> writes recovered | 2.32 s after nodes healthy |
+| post-heal write -> KDC serves it | 0.11 s |
+
+**Tests**: cargo 21 → 33. New: offline.rs round-trip through the file,
+0600 mode, age refusal, future-stamp refusal, corrupt/truncated/
+wrong-version tolerance + recovery, partial-cache miss semantics,
+multi-writer merge, newer-wins, flush-interval amplification bound; and
+in store.rs — fail-fast default preserved, startup budget actually spent
+then given up, and a full DB-less cold start (warm file + dead URI →
+serves K/M and the alias, SVC_UNAVAILABLE for anything unseen, writes
+still fail). Full `e2e/run.sh` green (TGS 7801.9/s), `e2e/chaos.sh` green.
+
+**Logging**: the plugin had none. Added `lib.rs::warn` — stderr with a
+`kdb_crdb:` prefix, via `writeln!` NOT `eprintln!` (which panics if
+stderr is closed, and this crate must never unwind across the C vtable).
+State changes only, never per-request.
+
+Docs: README gained a "Surviving a database outage" section (three-layer
+table, what is cached, threat model — same sensitivity class as a db2
+principal file minus the stash, staleness-as-revocation-window, fail-
+closed inventory); docs/runbooks.md gained runbook 4 (sizing both knobs,
+what to expect per operation, the log lines that identify the state,
+how to warm a cache deliberately).
+
+Open questions for the user: (1) `offline_cache_max_age_ms` has no
+default and no upper bound — should the plugin refuse absurd values
+(> 24h?) or stay operator's-rope? (2) the cache is capped at 16k entries;
+a 262k-machine realm gets hot-set coverage only — deliberate, but worth a
+decision if someone wants full-realm cold-start coverage. (3) kadmind
+still cannot start during an outage (no offline cache for admin roles) —
+intended, documented, not revisited.

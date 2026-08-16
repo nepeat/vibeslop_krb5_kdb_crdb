@@ -225,3 +225,102 @@ kdc.conf entries (multi-host failover masks it meanwhile).
 - Drain (`cockroach node drain`, as upgrade.yml does) is for restarts;
   decommission is for removal. Don't confuse them — drain moves
   leases, decommission moves replicas.
+
+---
+
+## 4. KDC cold start during a database outage
+
+For the case where a KDC **process** has to start (or restart) while
+CockroachDB is unreachable: power loss to a whole site, a rolling reboot
+that outruns the DB, an OOM kill mid-outage, a node replacement.
+
+The thing to internalise first: `stale_reads_ms` does **not** cover this.
+It works on the SQL session the process already has. A *new* session to a
+quorum-less node cannot be established at all — CRDB's own user lookup
+and descriptor leasing need writes — so a restarted KDC has nothing to
+read. Two knobs cover it instead (both in the `[dbmodules]` stanza; see
+README for the full text):
+
+```ini
+startup_retry_ms = 30000                 # every role
+offline_cache_path = /var/lib/krb5kdc/crdb-offline.cache   # KDC role only
+offline_cache_max_age_ms = 3600000                         # both or neither
+```
+
+### Sizing
+
+- **`startup_retry_ms`** — how long a daemon waits for the DB at boot
+  instead of exiting. Set it to comfortably exceed "DB comes up shortly
+  after me" (systemd ordering across hosts, k8s pod scheduling): 30s is a
+  reasonable default. Costs nothing when the DB is up. It is paid twice
+  on a KDC cold start (the supervisor opens the DB, then each `-w`
+  worker re-opens after fork), and the same budget capped at **2s**
+  bounds per-request reconnects so a hung DB cannot wedge a worker.
+- **`offline_cache_max_age_ms`** — this is a **revocation window**, not
+  an outage budget. During a full outage a disabled/deleted principal,
+  or one whose password changed, keeps authenticating for up to this long
+  after the KDC last read it. Pick it as "how late am I willing to honour
+  a revocation in exchange for staying up". 1h is a sane starting point;
+  anything past a shift change wants a compensating control.
+- The cache is fed **only by reads this KDC performed**. A KDC that has
+  been up and serving has a warm hot set; a KDC that has never run has
+  an empty file and will come up but answer nothing. Warm deliberately
+  after provisioning (see below) if cold-start coverage matters on day
+  one.
+- File size: bounded at 16k entries, roughly 3-6 MB. It is not a replica
+  of the realm and is not meant to be one.
+
+### What to expect during an outage
+
+| operation | result |
+|---|---|
+| KDC starts | comes up (after the retry budget lapses), logs `starting WITHOUT a database connection` |
+| `kinit`/`kvno` for a cached principal, inside max age | **works** |
+| lookup of a principal this KDC never read | fails with `KDC_ERR_SVC_UNAVAILABLE` — deliberately NOT "principal unknown" |
+| anything past max age | fails closed; nothing unbounded-stale is ever served |
+| kadmin write, `kdb5_util` anything | fails — admin roles never read the cache, and writes need quorum |
+| kadmind start | **fails** (no offline cache for admin roles); that is intended, bring it up with the database |
+| after the DB returns | reconnects within ~5s (reconnect breaker) + `entry_cache_ms`; live reads supersede the cache immediately |
+
+Recognising the state in the logs (stderr, so journald/`kubectl logs`):
+
+```
+kdb_crdb: startup: connect attempt 1 failed, retrying in 250ms
+kdb_crdb: startup: no connection after 5 attempts (30000ms budget)
+kdb_crdb: starting WITHOUT a database connection; serving from the offline cache until CRDB is reachable
+kdb_crdb: offline cache loaded: 412 entries
+kdb_crdb: reconnect: connected on attempt 2          <- recovered
+```
+
+### Warming the cache deliberately
+
+The cache only holds what the KDC served, so after standing up a new KDC
+(or restoring one from an image) drive the principals you care about
+through it once — a `kinit`/`kvno` loop over the service principals that
+must survive an outage is enough. `K/M@REALM` and `krbtgt/REALM@REALM`
+land automatically: krb5kdc reads K/M before it will listen, and every
+request touches krbtgt. Flushes ride the request flow at most once per
+10s, so leave the KDC serving for ≥10s after warming, then confirm:
+
+```sh
+ls -l /var/lib/krb5kdc/crdb-offline.cache   # must be 0600, non-empty
+grep -a 'K/M@' /var/lib/krb5kdc/crdb-offline.cache   # cold start needs this
+```
+
+### Handling the file
+
+Treat it exactly like a db2/LMDB `principal.db`: it holds
+master-key-encrypted key material plus principal metadata. It never holds
+the stash, so it is strictly weaker than the pair an attacker actually
+wants — but it is not public. 0600 (the plugin enforces it), on storage
+you already trust with the stash, wiped with the same care. Deleting it
+is always safe: the KDC starts empty and refills from the database.
+
+### Verification
+
+`e2e/cold-start.sh` (step 8 of `e2e/full-cycle.sh`) is the executable
+version of this runbook against the compose cluster: it warms the cache,
+stops all three nodes, restarts krb5kdc into the dead cluster, asserts
+auth works from the cache and that uncached lookups and writes fail with
+the right errors, ages the cache out, then heals and measures
+convergence.

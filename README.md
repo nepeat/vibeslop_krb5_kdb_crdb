@@ -74,6 +74,24 @@ schema.sql      multi-region DDL, GLOBAL tables, optional lockout side table
         # connection_uri (host1:26257,host2:26257,...) — the plugin
         # rotates the order per process and walks the list on reconnect.
         stale_reads_ms = 30000
+        # Cold-start resilience (see "Surviving a database outage").
+        # Budget in ms for the FIRST connection: retried with capped
+        # backoff (250ms doubling to 2s) instead of exiting, so a daemon
+        # that starts a few seconds ahead of the database waits instead
+        # of crash-looping. 0 (default) = fail fast, as before. The same
+        # budget, capped at 2s, bounds per-request reconnects.
+        startup_retry_ms = 30000
+        # Offline last-known-good entry cache, KDC role ONLY, off unless
+        # BOTH are set (setting one alone is a config error). Lets a KDC
+        # restart and serve AS/TGS with the database entirely gone —
+        # bounded-staleness reads cannot, because a NEW SQL session to a
+        # quorum-less node cannot be established at all. Entries older
+        # than the max age are refused, not served. Read the threat model
+        # before enabling: this file is as sensitive as a db2 principal
+        # file, and a disabled principal keeps authenticating from it for
+        # up to max_age during a full outage.
+        offline_cache_path = /var/lib/krb5kdc/crdb-offline.cache
+        offline_cache_max_age_ms = 3600000
     }
 
 [realms]
@@ -109,6 +127,66 @@ Point each region's KDCs at a local CRDB node/LB; DNS SRV or
   KRB5_PLUGIN_OP_NOTSUPP), but it runs **no DDL**. Schema creation is
   `schema.sql`'s job, deliberately — DDL from inside a KDC plugin is a
   footgun.
+
+## Surviving a database outage
+
+Three layers, each covering what the one above it cannot:
+
+| layer | knob | covers | bound |
+|---|---|---|---|
+| entry cache | `entry_cache_ms` | DB latency | 1s of staleness |
+| bounded-stale reads | `stale_reads_ms` | quorum loss, split brain, **while the process keeps running** | ~`stale_reads_ms` of outage |
+| offline cache | `offline_cache_path` + `offline_cache_max_age_ms` | **restart** during an outage — power loss, rolling reboot, OOM kill, node replacement | `offline_cache_max_age_ms` |
+
+The middle layer has a hard limit that is not obvious: it only works on
+an **existing** SQL session. Establishing a *new* session against a
+quorum-less CockroachDB node is architecturally impossible — session
+setup writes (`sqlliveness`, descriptor leasing) — so a KDC that restarts
+mid-outage has nothing to read, no matter how it connects. That is the
+gap the offline cache fills, and the reason `startup_retry_ms` alone is
+not enough.
+
+**What is cached**: the raw wire blobs exactly as stored in the
+`principals` table, keyed by principal name, plus the `aliases` rows a
+lookup needed, plus a written-at stamp per row. Fed only by successful
+KDC-role reads — it is a cache of what this KDC actually served, not a
+replica. Flushed with an atomic tmp+rename+fsync at most once per 10s,
+piggybacked on the request flow (no background thread: a KDC worker is
+one synchronous loop). `krb5kdc -w N` workers share the path and merge
+newest-stamp-wins, so they converge on the union of what the fleet read.
+A corrupt or unreadable cache file is logged and started empty; it can
+never keep the database from opening.
+
+**Threat model.** Key material inside the blobs is already encrypted
+under the realm master key before it reaches the DAL, so the file is in
+the same on-disk sensitivity class as a db2/LMDB principal database, and
+strictly weaker than one: it never contains the stash. An attacker who
+steals it gets what they would get from stealing `principal.db` **minus**
+the stash file — encrypted keys plus principal metadata (names,
+expiries, attributes, TL-data). Without the master key that is an
+offline-attack target of the same strength as the ciphertext already
+sitting in CockroachDB. Keep it 0600 (the plugin writes it that way) on
+storage you already trust with the stash, and destroy it with the same
+care.
+
+**Staleness is a revocation window.** During a full outage the KDC will
+keep authenticating a principal that was disabled, deleted, or had its
+password changed, for up to `offline_cache_max_age_ms` after the last
+time it read that principal — the cache cannot learn about a change it
+cannot see. Size the knob as "how long am I willing to honour a
+revocation late in exchange for staying up", not as "how long might my
+database be down". Lockout and last-auth counters are already required to
+be off for this backend, so no security counter depends on read freshness
+either way.
+
+**Fail-closed everywhere else.** Writes never touch the cache and keep
+failing without quorum. kadmind and kdb5_util never read it (admin
+decisions must never rest on data that did not come from a live, quorate
+database). Entries past the max age are refused rather than served. And a
+*miss* while offline returns `KDC_ERR_SVC_UNAVAILABLE`, never
+"principal unknown": the cache is partial by construction, and a partial
+cache that answered misses with NOENTRY could tell a client that a
+principal which exists does not.
 
 ## Known gaps / TODO
 
