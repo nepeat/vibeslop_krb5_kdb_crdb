@@ -1,0 +1,42 @@
+# {{ ansible_managed }}
+# Paths are IN-CONTAINER — see the quadlet Volume= lines for the mounts.
+[kdcdefaults]
+    kdc_ports = {{ kdc_port }}
+    kdc_tcp_ports = {{ kdc_port }}
+
+[realms]
+    {{ kdc_realm }} = {
+        database_module = crdb
+        acl_file = /config/kadm5.acl
+        key_stash_file = /secrets/master.stash
+        kadmind_port = {{ kdc_kadmind_port }}
+        kpasswd_port = {{ kdc_kpasswd_port }}
+        max_life = {{ kdc_max_life }}
+        max_renewable_life = {{ kdc_max_renewable_life }}
+    }
+
+{%- set ns = namespace(nodes=[]) %}
+{%- for h in groups['crdb'] | default([]) %}
+{%-   if crdb_region is not defined or (hostvars[h].crdb_region | default('')) == crdb_region %}
+{%-     set ns.nodes = ns.nodes + [(hostvars[h].crdb_advertise | default(hostvars[h].ansible_host)) ~ ':' ~ kdc_crdb_sql_port] %}
+{%-   endif %}
+{%- endfor %}
+
+[dbmodules]
+    db_module_dir = /opt/kdb
+    crdb = {
+        db_library = kdb_crdb
+        # Region-local nodes only (keeps reads in-region); the plugin
+        # rotates the host order per process and walks the list on
+        # reconnect, so gateway failover needs no LB in front.
+        connection_uri = postgresql://{{ kdc_crdb_user }}@{{ ns.nodes | join(',') }}/{{ kdc_crdb_database }}?sslmode=verify-full&sslrootcert=/secrets/ca.crt&sslcert=/secrets/client.{{ kdc_crdb_user }}.crt&sslkey=/secrets/client.{{ kdc_crdb_user }}.key&connect_timeout=3
+        disable_last_success = true
+        disable_lockout = true
+        entry_cache_ms = {{ kdc_entry_cache_ms }}
+        stale_reads_ms = {{ kdc_stale_reads_ms }}
+    }
+
+[logging]
+    kdc = STDERR
+    admin_server = STDERR
+    default = STDERR

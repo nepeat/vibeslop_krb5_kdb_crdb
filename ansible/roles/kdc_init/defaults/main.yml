@@ -1,0 +1,7 @@
+# Subset shared with kdc_node — keep in sync; group_vars override both.
+---
+kdc_realm: EXAMPLE.COM
+kdc_admin_principal: admin/admin
+kdc_conf_dir: /etc/kdc-crdb
+kdc_image_ref: localhost/kdc:latest
+kdc_local_secrets: "{{ playbook_dir }}/secrets"

@@ -1,0 +1,11 @@
+# {{ ansible_managed }}
+[libdefaults]
+    default_realm = {{ kdc_realm }}
+    dns_lookup_kdc = false
+
+[realms]
+    {{ kdc_realm }} = {
+        # Host-network container: this node's own KDC.
+        kdc = 127.0.0.1:{{ kdc_port }}
+        admin_server = {{ hostvars[kdc_admin_host].crdb_advertise | default(hostvars[kdc_admin_host].ansible_host) }}:{{ kdc_kadmind_port }}
+    }

@@ -1,0 +1,25 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Kerberos kadmind (kdb-crdb container)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+Image={{ kdc_image_ref }}
+ContainerName=kadmind
+Network=host
+ReadOnly=true
+Tmpfs=/tmp
+Exec=kadmind -nofork
+Environment=KRB5_CONFIG=/config/krb5.conf
+Environment=KRB5_KDC_PROFILE=/config/kdc.conf
+Volume={{ kdc_conf_dir }}/config:/config:ro
+Volume={{ kdc_conf_dir }}/secrets:/secrets:ro
+Volume={{ kdc_state_dir }}/run:/var/lib/krb5kdc
+
+[Service]
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

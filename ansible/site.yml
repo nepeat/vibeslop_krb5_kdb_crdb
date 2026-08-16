@@ -75,3 +75,31 @@
     - name: Show summary
       ansible.builtin.debug:
         msg: "{{ _status.stdout_lines }}"
+
+# ---- Kerberos KDCs (containerized: nix-built image, podman quadlets) ----
+
+- name: KDC nodes (image, config, quadlet units)
+  hosts: kdc
+  become: true
+  serial: 1
+  tags: [kdc]
+  roles:
+    - kdc_node
+
+- name: Realm bootstrap (K/M + stash + admin principal, once)
+  hosts: kdc[0]
+  become: true
+  tags: [kdc, kdc-init]
+  roles:
+    - kdc_init
+
+- name: Distribute stash, start KDCs, verify ticket issuance
+  hosts: kdc
+  become: true
+  serial: 1
+  tags: [kdc, kdc-verify]
+  tasks:
+    - name: Start + smoke-test this KDC
+      ansible.builtin.include_role:
+        name: kdc_node
+        tasks_from: start

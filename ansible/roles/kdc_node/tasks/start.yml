@@ -1,0 +1,40 @@
+# Entry point for site.yml's final KDC play (include_role tasks_from:
+# start): distribute the stash kdc_init banked on the controller, start
+# the quadlet units, and prove this node issues tickets.
+---
+- name: Install master stash
+  ansible.builtin.copy:
+    src: "{{ kdc_local_secrets }}/master.stash"
+    dest: "{{ kdc_conf_dir }}/secrets/master.stash"
+    mode: "0600"
+  register: _kdc_stash_dist
+
+- name: Start krb5kdc
+  ansible.builtin.systemd:
+    name: krb5kdc.service
+    state: "{{ 'restarted' if _kdc_stash_dist.changed else 'started' }}"
+    daemon_reload: true
+
+- name: Start kadmind (admin host)
+  ansible.builtin.systemd:
+    name: kadmind.service
+    state: "{{ 'restarted' if _kdc_stash_dist.changed else 'started' }}"
+  when: inventory_hostname == kdc_admin_host
+
+- name: Smoke test — AS-REQ against this node's KDC
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      printf '%s\n' "$KDC_ADMIN_PW"
+      | podman exec -i krb5kdc kinit -c /tmp/ansible-smoke
+        {{ kdc_admin_principal }}@{{ kdc_realm }}
+      && podman exec krb5kdc kdestroy -c /tmp/ansible-smoke
+    executable: /bin/bash
+  environment:
+    KDC_ADMIN_PW: "{{ lookup('password', kdc_local_secrets + '/kdc-admin-pass length=32 chars=ascii_letters,digits') }}"
+  register: _kdc_smoke
+  retries: 5
+  delay: 3
+  until: _kdc_smoke.rc == 0
+  changed_when: false
+  no_log: true

@@ -1,0 +1,25 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Kerberos KDC (kdb-crdb container)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+Image={{ kdc_image_ref }}
+ContainerName=krb5kdc
+Network=host
+ReadOnly=true
+Tmpfs=/tmp
+Exec=krb5kdc -n -w {{ kdc_workers }}
+Environment=KRB5_CONFIG=/config/krb5.conf
+Environment=KRB5_KDC_PROFILE=/config/kdc.conf
+Volume={{ kdc_conf_dir }}/config:/config:ro
+Volume={{ kdc_conf_dir }}/secrets:/secrets:ro
+Volume={{ kdc_state_dir }}/run:/var/lib/krb5kdc
+
+[Service]
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,40 @@
+# KDC-from-container knobs. Realm/paths shared with kdc_init — group_vars
+# override both; keep the duplicated subset in sync.
+---
+kdc_realm: EXAMPLE.COM
+kdc_admin_principal: admin/admin
+# kadmind + the one-time realm bootstrap run here.
+kdc_admin_host: "{{ groups['kdc'] | first }}"
+
+# Host-network ports (rootful podman, so the privileged ones bind fine).
+kdc_port: 88
+kdc_kadmind_port: 749
+kdc_kpasswd_port: 464
+
+# krb5kdc worker processes — DB-latency-bound, oversubscribe cores.
+kdc_workers: 8
+
+kdc_max_life: "10h 0m 0s"
+kdc_max_renewable_life: "7d 0h 0m 0s"
+
+# Plugin knobs — read docs/progress.md 2026-08-16 before touching.
+kdc_entry_cache_ms: 1000
+kdc_stale_reads_ms: 30000
+
+# Mirrors the crdb group_vars (schema.sql's database + low-priv user).
+kdc_crdb_database: krb5
+kdc_crdb_user: krb5kdc
+kdc_crdb_sql_port: 26257
+
+# Host paths, mounted into the container (see the quadlet templates).
+kdc_conf_dir: /etc/kdc-crdb
+kdc_state_dir: /var/lib/kdc-crdb
+
+# Controller side: the repo flake builds the image; secrets dir is the
+# same vault crdb_certs writes (client certs, stash, generated passwords).
+kdc_image_flake: "{{ playbook_dir }}/.."
+kdc_image_ref: localhost/kdc:latest
+kdc_local_secrets: "{{ playbook_dir }}/secrets"
+# Optional prebuilt docker-archive tarball — set it when the controller
+# can't `nix build` the target arch (e.g. arm fleet, x86 controller
+# without binfmt): kdc_image_tar: /path/to/kdc-image.tar.gz

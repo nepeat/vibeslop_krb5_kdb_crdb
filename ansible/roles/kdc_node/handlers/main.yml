@@ -1,0 +1,16 @@
+# try-restart, not restart: a no-op until site.yml's final play has
+# started the services — on a first run there's no stash yet, and a plain
+# restart would start the KDC too early and crash-loop it.
+---
+- name: kdc daemon-reload
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: try-restart krb5kdc
+  ansible.builtin.command: systemctl try-restart krb5kdc.service
+  changed_when: true
+
+- name: try-restart kadmind
+  ansible.builtin.command: systemctl try-restart kadmind.service
+  changed_when: true
+  when: inventory_hostname == kdc_admin_host

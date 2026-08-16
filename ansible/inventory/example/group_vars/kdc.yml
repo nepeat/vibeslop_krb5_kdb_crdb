@@ -1,0 +1,16 @@
+# KDC group tunables. The container image comes from the repo flake
+# (`nix build .#kdc-image` on the controller, shipped + podman-loaded by
+# kdc_node) — see roles/kdc_node/defaults/main.yml for the full knob set.
+
+kdc_realm: EXAMPLE.COM
+
+# krb5kdc worker processes; DB-latency-bound, so oversubscribe cores.
+kdc_workers: 8
+
+# kadmind + the one-time realm bootstrap run on the first [kdc] host by
+# default; pin it explicitly if the group order may change:
+# kdc_admin_host: crdb-sea-0
+
+# Cross-arch fleets (arm hosts, x86 controller): either enable qemu
+# binfmt for nix or point every arm host at a prebuilt tarball:
+# kdc_image_tar: /path/to/kdc-image.tar.gz

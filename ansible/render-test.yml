@@ -38,3 +38,26 @@
         mode: "0644"
       run_once: true
       delegate_to: localhost
+
+- name: Render KDC config (no remote connections)
+  hosts: kdc
+  gather_facts: false
+  connection: local
+  vars_files:
+    - roles/kdc_node/defaults/main.yml
+  tasks:
+    - name: Render kdc.conf to /tmp/kdc-crdb-kdc.conf
+      ansible.builtin.template:
+        src: roles/kdc_node/templates/kdc.conf.j2
+        dest: /tmp/kdc-crdb-kdc.conf
+        mode: "0644"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Render krb5kdc quadlet to /tmp/kdc-crdb-krb5kdc.container
+      ansible.builtin.template:
+        src: roles/kdc_node/templates/krb5kdc.container.j2
+        dest: /tmp/kdc-crdb-krb5kdc.container
+        mode: "0644"
+      run_once: true
+      delegate_to: localhost

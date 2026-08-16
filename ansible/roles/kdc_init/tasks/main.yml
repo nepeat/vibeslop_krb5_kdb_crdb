@@ -1,0 +1,84 @@
+# One-time realm bootstrap, run on the admin host only: master stash +
+# K/M written through the plugin into CRDB (kdb5_util in the container),
+# admin principal, stash banked controller-side for the other KDCs.
+# Everything is guarded — safe to re-run.
+---
+- name: Generate/load master + admin passwords (controller-side files)
+  ansible.builtin.set_fact:
+    _kdc_master_pw: "{{ lookup('password', kdc_local_secrets + '/kdc-master-pass length=32 chars=ascii_letters,digits') }}"
+  no_log: true
+
+- name: Check for a controller-side stash backup
+  ansible.builtin.stat:
+    path: "{{ kdc_local_secrets }}/master.stash"
+  delegate_to: localhost
+  become: false
+  register: _kdc_stash_ctl
+
+- name: Restore stash from the controller backup
+  ansible.builtin.copy:
+    src: "{{ kdc_local_secrets }}/master.stash"
+    dest: "{{ kdc_conf_dir }}/secrets/master.stash"
+    mode: "0600"
+  when: _kdc_stash_ctl.stat.exists
+
+- name: Check for a stash on this host
+  ansible.builtin.stat:
+    path: "{{ kdc_conf_dir }}/secrets/master.stash"
+  register: _kdc_stash
+
+# Fresh realm only. If the realm exists in CRDB but every stash copy is
+# lost, this fails on the duplicate K/M — recover with `kdb5_util stash`
+# and the banked master password instead (see runbooks).
+- name: Create realm (kdb5_util create -s)
+  ansible.builtin.command:
+    cmd: >-
+      podman run --rm --network host
+      -v {{ kdc_conf_dir }}/config:/config:ro
+      -v {{ kdc_conf_dir }}/secrets:/secrets
+      -e KRB5_CONFIG=/config/krb5.conf
+      -e KRB5_KDC_PROFILE=/config/kdc.conf
+      {{ kdc_image_ref }}
+      kdb5_util create -s -r {{ kdc_realm }} -P {{ _kdc_master_pw }}
+  no_log: true
+  when: not _kdc_stash.stat.exists
+
+- name: Bank the stash on the controller
+  ansible.builtin.fetch:
+    src: "{{ kdc_conf_dir }}/secrets/master.stash"
+    dest: "{{ kdc_local_secrets }}/master.stash"
+    flat: true
+
+- name: Tighten banked stash perms
+  ansible.builtin.file:
+    path: "{{ kdc_local_secrets }}/master.stash"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+
+- name: Does the admin principal exist?
+  ansible.builtin.command:
+    cmd: >-
+      podman run --rm --network host
+      -v {{ kdc_conf_dir }}/config:/config:ro
+      -v {{ kdc_conf_dir }}/secrets:/secrets:ro
+      -e KRB5_CONFIG=/config/krb5.conf
+      -e KRB5_KDC_PROFILE=/config/kdc.conf
+      {{ kdc_image_ref }}
+      kadmin.local -r {{ kdc_realm }} -q "getprinc {{ kdc_admin_principal }}"
+  register: _kdc_getprinc
+  changed_when: false
+  failed_when: false
+
+- name: Create admin principal
+  ansible.builtin.command:
+    cmd: >-
+      podman run --rm --network host
+      -v {{ kdc_conf_dir }}/config:/config:ro
+      -v {{ kdc_conf_dir }}/secrets:/secrets:ro
+      -e KRB5_CONFIG=/config/krb5.conf
+      -e KRB5_KDC_PROFILE=/config/kdc.conf
+      {{ kdc_image_ref }}
+      kadmin.local -r {{ kdc_realm }} -q "addprinc -pw {{ lookup('password', kdc_local_secrets + '/kdc-admin-pass length=32 chars=ascii_letters,digits') }} {{ kdc_admin_principal }}"
+  no_log: true
+  when: (kdc_admin_principal ~ '@' ~ kdc_realm) not in _kdc_getprinc.stdout
