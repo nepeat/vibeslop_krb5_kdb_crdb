@@ -644,3 +644,11 @@ beats the sea1 numbers. c7g region consistently ~30% slower (Graviton3
 vs 4); use1/usw2 swapped ranks between runs (noise), c7g last in both.
 
 Infra still RUNNING at entry time (teardown decision pending user).
+
+## 2026-08-16: burn #2 teardown + repo published
+
+tofu destroy: 56/56, verified 0 project instances in all 3 regions (the
+lone us-west-2 survivor is an unrelated 2021-era t4g.micro). Repo now
+public at https://github.com/nepeat/vibeslop_krb5_kdb_crdb (HTTPS
+remote — no GitHub SSH key on this box). Registry images:
+hub.generalprogramming.org/erinpublic/kdc {latest, e52f869} multi-arch.
