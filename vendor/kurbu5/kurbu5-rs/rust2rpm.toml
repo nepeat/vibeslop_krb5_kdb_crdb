@@ -1,0 +1,14 @@
+# rust2rpm configuration for kurbu5-rs
+# Safe, idiomatic Rust API for writing MIT Kerberos non-KDB plugin modules.
+# Depends on kurbu5-sys (path dependency, in-workspace) and libc.
+# The optional `derive` feature pulls in kurbu5-derive (also in-workspace).
+
+[requires]
+# krb5-devel and clang-devel are needed transitively because kurbu5-sys
+# (a workspace member) runs bindgen against krb5-devel headers at build time.
+# MIT Kerberos >= 1.22 is required for the API surface this crate covers.
+build = [
+    "krb5-devel >= 1.22",
+    "clang-devel",
+    "pkgconf-pkg-config",
+]

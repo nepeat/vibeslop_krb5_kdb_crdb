@@ -1,0 +1,18 @@
+# rust2rpm configuration for kurbu5-kadm5-sys
+# KADM5 plugin API bindings; links = "kadm5srv_mit".
+# Re-exports kurbu5-sys types and adds libkadm5srv_mit linkage.
+# Depends on kurbu5-sys (in-workspace) and libc.
+
+[package]
+summary = "KADM5 plugin API FFI bindings for MIT Kerberos KDC"
+description = "KADM5 plugin API bindings for MIT Kerberos. Links the kadm5srv\nshared library and re-exports kurbu5-sys types, enabling build\nmetadata for downstream KADM5 plugin crates."
+
+[requires]
+# krb5-devel provides libkadm5srv_mit.so symlink and headers.
+# Confirmed by: pkg-config --libs kadm-server => -lkadm5srv_mit
+# MIT Kerberos >= 1.22 is required for the KADM5 plugin API this crate covers.
+build = [
+    "krb5-devel >= 1.22",
+    "clang-devel",
+    "pkgconf-pkg-config",
+]

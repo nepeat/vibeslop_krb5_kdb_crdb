@@ -1,0 +1,20 @@
+[package]
+name         = "kurbu5-kdb-sys"
+version.workspace    = true
+edition.workspace    = true
+description  = "KDB plugin API re-export — thin wrapper over kurbu5-sys adding libkdb5 linkage"
+license.workspace = true
+repository.workspace = true
+authors.workspace    = true
+readme       = "../README.md"
+keywords     = ["kerberos", "krb5", "kdb", "ffi", "sys"]
+categories   = ["external-ffi-bindings"]
+# 'links' ensures exactly one crate links kdb5 and enables DEP_KDB5_* metadata.
+links        = "kdb5"
+
+[lints]
+workspace = true
+
+[dependencies]
+kurbu5-sys = { path = "../../kurbu5-sys", version = "0.1" }
+libc.workspace = true

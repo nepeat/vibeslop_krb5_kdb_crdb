@@ -1,0 +1,2 @@
+# Dependency file for the crates/ directory.
+# No C sources are compiled here; all dependency tracking is handled by Cargo.

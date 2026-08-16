@@ -1,0 +1,13 @@
+# rust2rpm configuration for kurbu5-kdb-rs
+# Safe, idiomatic Rust API for writing MIT Kerberos KDB driver plugins.
+# Depends on kurbu5-sys, kurbu5-rs, kurbu5-kdb-sys (all in-workspace), plus
+# libc and bitflags from crates.io.
+# The optional `derive` feature pulls in kurbu5-kdb-derive (in-workspace).
+
+[requires]
+# MIT Kerberos >= 1.22 is required for the KDB plugin API this crate covers.
+build = [
+    "krb5-devel >= 1.22",
+    "clang-devel",
+    "pkgconf-pkg-config",
+]

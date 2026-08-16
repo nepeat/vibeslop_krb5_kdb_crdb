@@ -1,0 +1,22 @@
+[package]
+name         = "kurbu5-kadm5-sys"
+version.workspace    = true
+edition.workspace    = true
+description  = "KADM5 plugin API bindings — links libkadm5srv_mit and re-exports kurbu5-sys types"
+license.workspace = true
+repository.workspace = true
+authors.workspace    = true
+readme       = "../README.md"
+keywords     = ["kerberos", "krb5", "kadm5", "ffi", "sys"]
+categories   = ["external-ffi-bindings"]
+# 'links' ensures exactly one crate links kadm5srv_mit and enables
+# DEP_KADM5SRV_MIT_* build metadata for downstream crates.
+# Library name confirmed by: pkg-config --libs kadm-server → -lkadm5srv_mit
+links        = "kadm5srv_mit"
+
+[lints]
+workspace = true
+
+[dependencies]
+kurbu5-sys = { path = "../../kurbu5-sys", version = "0.1" }
+libc.workspace = true

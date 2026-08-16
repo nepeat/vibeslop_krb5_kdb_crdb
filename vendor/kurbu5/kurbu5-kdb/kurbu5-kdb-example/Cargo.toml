@@ -1,0 +1,17 @@
+[package]
+name         = "kurbu5-kdb-example"
+version.workspace    = true
+edition.workspace    = true
+description  = "Example MIT Kerberos KDB plugin written in Rust using kurbu5-kdb-rs"
+license.workspace = true
+publish      = false
+
+[lints]
+workspace = true
+
+# A KDB plugin must be a C-compatible dynamic library.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+kurbu5-kdb-rs = { path = "../kurbu5-kdb-rs", version = "0.1", features = ["derive"] }

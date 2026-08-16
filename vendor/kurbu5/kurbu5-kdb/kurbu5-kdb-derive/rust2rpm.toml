@@ -1,0 +1,17 @@
+# rust2rpm configuration for kurbu5-kdb-derive
+# Proc-macro derive crate for kurbu5-kdb-rs KDB driver plugins.
+# proc-macro = true; dependencies are syn, quote, proc-macro2 (all in Fedora).
+# No features.
+
+[package]
+summary = "Derive macro for kurbu5-kdb-rs KDB driver plugins"
+description = "Derive macros for MIT Kerberos KDB driver plugins\nimplemented using the kurbu5-kdb-rs crate."
+
+[requires]
+# krb5-devel and clang-devel are needed transitively via kurbu5-sys bindgen.
+# MIT Kerberos >= 1.22 is required for the KDB plugin API this workspace covers.
+build = [
+    "krb5-devel >= 1.22",
+    "clang-devel",
+    "pkgconf-pkg-config",
+]

@@ -1,0 +1,29 @@
+[package]
+name         = "kurbu5-kdb-rs"
+version.workspace    = true
+edition.workspace    = true
+description  = "Safe, idiomatic Rust API for writing MIT Kerberos KDB driver plugins"
+license.workspace = true
+repository.workspace = true
+authors.workspace    = true
+readme       = "../README.md"
+keywords     = ["kerberos", "krb5", "kdb", "plugin"]
+categories   = ["api-bindings", "authentication"]
+
+[lints]
+workspace = true
+
+[dependencies]
+kurbu5-sys        = { path = "../../kurbu5-sys", version = "0.1" }
+kurbu5-rs         = { path = "../../kurbu5-rs", version = "0.1" }
+kdb_sys           = { package = "kurbu5-kdb-sys", path = "../kurbu5-kdb-sys", version = "0.1" }
+kurbu5-kdb-derive = { path = "../kurbu5-kdb-derive", version = "0.1", optional = true }
+libc.workspace    = true
+bitflags.workspace = true
+
+[features]
+derive = ["dep:kurbu5-kdb-derive"]
+
+[dev-dependencies]
+# For integration tests that need a real krb5_context.
+# (Only used when a Kerberos environment is available at test time.)

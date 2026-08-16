@@ -1,0 +1,14 @@
+# rust2rpm configuration for kurbu5-kdb-sys
+# Thin wrapper over kurbu5-sys that adds explicit linkage to libkdb5.
+# links = "kdb5"; depends on kurbu5-sys and libc.
+# No features beyond the implicit default.
+
+[requires]
+# krb5-devel provides libkdb5.so symlink and headers.
+# clang-devel is needed because kurbu5-sys (a transitive dep) runs bindgen.
+# MIT Kerberos >= 1.22 is required for the KDB plugin API this crate covers.
+build = [
+    "krb5-devel >= 1.22",
+    "clang-devel",
+    "pkgconf-pkg-config",
+]

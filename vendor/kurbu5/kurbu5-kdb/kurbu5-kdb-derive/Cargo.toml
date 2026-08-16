@@ -1,0 +1,22 @@
+[package]
+name         = "kurbu5-kdb-derive"
+version.workspace    = true
+edition.workspace    = true
+description  = "Proc-macro derive for kurbu5-kdb-rs KDB driver plugins"
+license.workspace = true
+repository.workspace = true
+authors.workspace    = true
+readme       = "../README.md"
+keywords     = ["kerberos", "krb5", "kdb", "derive", "proc-macro"]
+categories   = ["development-tools::procedural-macro-helpers"]
+
+[lints]
+workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn.workspace         = true
+quote.workspace       = true
+proc-macro2.workspace = true

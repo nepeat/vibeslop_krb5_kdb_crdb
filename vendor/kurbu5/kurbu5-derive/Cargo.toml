@@ -1,0 +1,48 @@
+[package]
+name         = "kurbu5-derive"
+version.workspace    = true
+edition.workspace    = true
+description  = "Proc-macro derives for kurbu5-rs non-KDB plugin interfaces"
+license.workspace = true
+repository.workspace = true
+authors.workspace    = true
+keywords     = ["kerberos", "krb5", "derive", "proc-macro"]
+categories   = ["development-tools::procedural-macro-helpers"]
+
+[lints]
+workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn.workspace         = true
+quote.workspace       = true
+proc-macro2.workspace = true
+
+[dev-dependencies]
+# kurbu5-rs with pwqual+derive features is the crate under test.
+kurbu5-rs = { path = "../kurbu5-rs", features = ["pwqual", "derive"] }
+
+[features]
+# One feature per interface, mirroring kurbu5-rs.
+pwqual     = []
+hostrealm  = []
+localauth  = []
+ccselect   = []
+kdcpreauth = []
+clpreauth  = []
+kdcpolicy  = []
+certauth   = []
+audit      = []
+full = [
+    "pwqual",
+    "hostrealm",
+    "localauth",
+    "ccselect",
+    "kdcpreauth",
+    "clpreauth",
+    "kdcpolicy",
+    "certauth",
+    "audit",
+]

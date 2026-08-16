@@ -1,0 +1,39 @@
+[package]
+name         = "kurbu5-kadm5-rs"
+version.workspace    = true
+edition.workspace    = true
+description  = "Safe, idiomatic Rust API for writing MIT Kerberos KADM5_AUTH and KADM5_HOOK plugin modules"
+license.workspace = true
+repository.workspace = true
+authors.workspace    = true
+readme       = "../README.md"
+keywords     = ["kerberos", "krb5", "kadm5", "plugin"]
+categories   = ["api-bindings", "authentication"]
+
+[lints]
+workspace = true
+
+[dependencies]
+kurbu5-kadm5-sys    = { path = "../kurbu5-kadm5-sys", version = "0.1" }
+kurbu5-sys          = { path = "../../kurbu5-sys", version = "0.1" }
+kurbu5-rs           = { path = "../../kurbu5-rs", version = "0.1" }
+libc.workspace      = true
+kurbu5-kadm5-derive = { path = "../kurbu5-kadm5-derive", version = "0.1", optional = true, features = ["kadm5_auth", "kadm5_hook"] }
+
+[features]
+# kadm5_auth is enabled by default so that `cargo test --workspace` exercises
+# the KADM5_AUTH unit tests without requiring explicit --features flags.
+default = ["kadm5_auth"]
+
+# Individual plugin interface features.
+kadm5_auth = []
+kadm5_hook = []
+# Local kadm5 admin API (kadm5_init_with_password, create/chpass principal).
+admin = []
+
+# Re-export the proc-macro derive crate.  Enables #[derive(Kadm5AuthModule)]
+# and #[derive(Kadm5HookModule)] for users who depend on kurbu5-kadm5-rs.
+derive = ["kurbu5-kadm5-derive"]
+
+# Enable all KADM5 plugin interfaces in one shot.
+full = ["kadm5_auth", "kadm5_hook", "admin", "derive"]

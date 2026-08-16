@@ -1,0 +1,4 @@
+/target/
+.claude/
+contrib/release/__pycache__/
+docs/superpowers/

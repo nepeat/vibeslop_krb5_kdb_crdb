@@ -1,0 +1,20 @@
+# rust2rpm configuration for kurbu5-derive
+# Proc-macro derive crate for kurbu5-rs non-KDB plugin interfaces.
+# proc-macro = true; dependencies are syn, quote, proc-macro2 (all in Fedora).
+# Dev-dependency on kurbu5-rs is only used for integration tests.
+
+[package]
+summary = "Derive macros for kurbu5-rs non-KDB plugin interfaces"
+description = "Derive macros for the nine MIT Kerberos non-KDB plugin interfaces\n(PWQUAL, HOSTREALM, LOCALAUTH, CCSELECT, KDCPREAUTH, CLPREAUTH,\nKDCPOLICY, CERTAUTH, AUDIT) as implemented by kurbu5-rs."
+
+[requires]
+# krb5-devel and clang-devel are needed at build time because the workspace
+# Cargo.lock includes kurbu5-sys, which runs bindgen against krb5-devel
+# headers.  Even though kurbu5-derive itself does not link any C library,
+# the workspace build pulls in kurbu5-sys for dev-dependency test resolution.
+# MIT Kerberos >= 1.22 is required for the API surface this workspace covers.
+build = [
+    "krb5-devel >= 1.22",
+    "clang-devel",
+    "pkgconf-pkg-config",
+]

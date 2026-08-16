@@ -1,0 +1,41 @@
+dnl configure.ac fragment — Rust KDB plugin framework (kurbu5)
+dnl
+dnl Add this block to krb5/src/configure.ac to integrate the Rust workspace
+dnl into the standard krb5 autoconf build.
+dnl
+dnl Placement: after the lmdb_plugin_dir block (around line 1355), before the
+dnl final K5_GEN_FILE / AC_OUTPUT calls.
+dnl
+dnl Also add  @rust_kdb_dir@  to the SUBDIRS list in src/Makefile.in.
+
+dnl ---------------------------------------------------------------------------
+dnl Rust KDB plugin support
+dnl ---------------------------------------------------------------------------
+
+rust_kdb_dir=""
+
+AC_ARG_ENABLE([rust-kdb],
+  [AS_HELP_STRING([--enable-rust-kdb],
+    [build the Rust KDB plugin framework (requires Cargo) @<:@no@:>@])],
+  [], [enableval=no])
+
+if test "$enableval" != no; then
+  dnl Locate the cargo binary.  AC_PATH_PROG sets CARGO="" if not found.
+  AC_PATH_PROG([CARGO], [cargo], [no])
+  if test "$CARGO" = no; then
+    if test "$enableval" = yes; then
+      AC_MSG_ERROR([--enable-rust-kdb requires cargo (Rust toolchain) in PATH])
+    else
+      AC_MSG_WARN([cargo not found; disabling Rust KDB support])
+    fi
+  else
+    dnl Verify the toolchain is recent enough (edition 2021 needs Rust >= 1.56).
+    rust_version=`$CARGO --version 2>/dev/null | sed 's/cargo //'`
+    AC_MSG_NOTICE([Using cargo $rust_version for Rust KDB support])
+    rust_kdb_dir=crates
+    K5_GEN_MAKEFILE(crates)
+  fi
+fi
+
+AC_SUBST(CARGO)
+AC_SUBST(rust_kdb_dir)

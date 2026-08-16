@@ -1,0 +1,25 @@
+--- a/kurbu5-kdb/kurbu5-kdb-rs/src/key_data.rs	2026-08-16 00:39:47.757828324 +0000
++++ b/kurbu5-kdb/kurbu5-kdb-rs/src/key_data.rs	2026-08-16 00:40:17.877465710 +0000
+@@ -36,6 +36,22 @@
+         self.inner.key_data_type[1]
+     }
+ 
++    /// Raw `key_data_ver`: 1 = key only, 2 = key + salt slot.
++    ///
++    /// Needed to distinguish a v2 key with a zero-length salt from a v1
++    /// key — `salt_bytes()` returns empty for both.
++    #[must_use]
++    pub fn key_data_ver(&self) -> i16 {
++        self.inner.key_data_ver
++    }
++
++    /// Whether a salt slot is present (`key_data_ver >= 2`), independent
++    /// of the salt being empty.
++    #[must_use]
++    pub fn has_salt(&self) -> bool {
++        self.inner.key_data_ver >= 2
++    }
++
+     /// Raw (encrypted) key bytes.
+     #[must_use]
+     pub fn key_bytes(&self) -> &'a [u8] {

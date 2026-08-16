@@ -1,0 +1,31 @@
+[package]
+name         = "kurbu5-kadm5-derive"
+version.workspace    = true
+edition.workspace    = true
+description  = "Proc-macro derives for kurbu5-kadm5-rs KADM5_AUTH and KADM5_HOOK plugin interfaces"
+license.workspace = true
+repository.workspace = true
+authors.workspace    = true
+readme       = "../README.md"
+keywords     = ["kerberos", "krb5", "kadm5", "derive", "proc-macro"]
+categories   = ["development-tools::procedural-macro-helpers"]
+
+[lints]
+workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn.workspace         = true
+quote.workspace       = true
+proc-macro2.workspace = true
+
+[dev-dependencies]
+# kurbu5-kadm5-rs with derive feature is the crate under test.
+kurbu5-kadm5-rs = { path = "../kurbu5-kadm5-rs", features = ["kadm5_auth", "kadm5_hook", "derive"] }
+
+[features]
+kadm5_auth = []
+kadm5_hook = []
+full = ["kadm5_auth", "kadm5_hook"]

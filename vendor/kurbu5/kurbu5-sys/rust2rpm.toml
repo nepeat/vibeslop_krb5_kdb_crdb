@@ -1,0 +1,12 @@
+# rust2rpm configuration for kurbu5-sys
+# This crate uses bindgen at build time to generate FFI bindings from the
+# installed krb5-devel headers.  Rebuild whenever krb5-devel is updated.
+
+[requires]
+# System build-dependencies required by build.rs (bindgen + pkg-config).
+# MIT Kerberos >= 1.22 is required for the API surface this crate covers.
+build = [
+    "krb5-devel >= 1.22",
+    "clang-devel",
+    "pkgconf-pkg-config",
+]

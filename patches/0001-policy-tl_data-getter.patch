@@ -1,0 +1,17 @@
+--- a/kurbu5-kdb/kurbu5-kdb-rs/src/policy.rs	2026-08-16 00:39:47.757828324 +0000
++++ b/kurbu5-kdb/kurbu5-kdb-rs/src/policy.rs	2026-08-16 00:40:14.121308356 +0000
+@@ -212,6 +212,14 @@
+         self.tl_data.push((ty, data));
+     }
+ 
++    /// Iterate over the TL-data records, in insertion order.
++    ///
++    /// Symmetric with [`PolicyEntry::add_tl_data`]: backends that persist
++    /// policies themselves need read access to round-trip TL-data.
++    pub fn tl_data(&self) -> impl Iterator<Item = (u16, &[u8])> {
++        self.tl_data.iter().map(|(ty, data)| (*ty, data.as_slice()))
++    }
++
+     /// Construct from a zero-copy view, copying all fields.
+     pub fn from_ref(r: PolicyEntryRef<'_>) -> Self {
+         let mut p = PolicyEntry::new(r.name());

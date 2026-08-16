@@ -1,0 +1,17 @@
+# rust2rpm configuration for kurbu5-kadm5-rs
+# Safe, idiomatic Rust API for writing MIT Kerberos KADM5_AUTH and KADM5_HOOK
+# plugin modules.  Depends on kurbu5-kadm5-sys, kurbu5-sys, kurbu5-rs (all
+# in-workspace) and libc.
+# The optional `derive` feature pulls in kurbu5-kadm5-derive (in-workspace).
+# Features: kadm5_auth (default), kadm5_hook, derive, full.
+
+[package]
+summary = "Safe Rust API for writing MIT Kerberos KADM5 plugin modules"
+
+[requires]
+# MIT Kerberos >= 1.22 is required for the KADM5 plugin API this crate covers.
+build = [
+    "krb5-devel >= 1.22",
+    "clang-devel",
+    "pkgconf-pkg-config",
+]

@@ -1,0 +1,40 @@
+mydir=crates
+BUILDTOP=$(REL)..
+
+# Cargo binary and optional header/lib overrides — substituted by configure.
+CARGO = @CARGO@
+
+# The installed krb5 header directory (from pre.in via configure).
+# Passed to kurbu5-sys/build.rs via the KRB5_INCLUDE_DIR environment
+# variable so bindgen can find krb5.h and kdb.h without pkg-config.
+KRB5_INCLUDE_DIR_OVERRIDE = $(KRB5_INCDIR)
+KRB5_LIB_DIR_OVERRIDE     = $(KRB5_LIBDIR)
+
+CARGO_ENV = \
+	KRB5_INCLUDE_DIR=$(KRB5_INCLUDE_DIR_OVERRIDE) \
+	KRB5_LIB_DIR=$(KRB5_LIB_DIR_OVERRIDE)
+
+# ---------------------------------------------------------------------------
+# Standard krb5 Makefile.in targets
+# ---------------------------------------------------------------------------
+
+all-unix:: build-cargo
+
+build-cargo:
+	cd $(srcdir) && $(CARGO_ENV) $(CARGO) build --workspace --release
+
+install-unix::
+
+check-unix:: check-cargo-fmt check-cargo-clippy check-cargo-test
+
+check-cargo-fmt:
+	cd $(srcdir) && $(CARGO) fmt --check --all
+
+check-cargo-clippy:
+	cd $(srcdir) && $(CARGO_ENV) $(CARGO) clippy --workspace -- -D warnings
+
+check-cargo-test:
+	cd $(srcdir) && $(CARGO_ENV) $(CARGO) test --workspace
+
+clean-unix::
+	cd $(srcdir) && $(CARGO) clean

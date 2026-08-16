@@ -1,0 +1,271 @@
+---
+# Project: https://codeberg.org/abbra/kurbu5
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # System packages required to compile kurbu5 and to run JavaScript-based
+  # GitHub Actions (actions/checkout, actions/cache) inside the container.
+  #   tar, gzip               — archive tools needed by actions/checkout and actions/cache
+  #   gcc, gcc-c++, make      — C/C++ toolchain for the kurbu5-sys / -kdb-sys / -kadm5-sys FFI crates
+  #   krb5-devel              — libkrb5 / libgssapi_krb5 headers for the FFI bindings
+  #   clang-libs, clang-devel — libclang.so + built-in headers (stdarg.h etc.) for bindgen
+  #   pkgconf-pkg-config      — pkg-config used by the *-sys build scripts
+  #   python3                 — TOC validation and Rust doc sample checks
+  #   nodejs, npm, node       — required by actions/checkout and actions/cache
+  #   cargo, rust, rustfmt, cargo-clippy — Rust toolchain (not bundled in the base image)
+  # (update key suffix when changing packages)
+  DNF_PACKAGES: >-
+    tar gzip gcc gcc-c++ make krb5-devel clang-libs clang-devel
+    pkgconf-pkg-config python3 nodejs /usr/bin/npm /usr/bin/node
+    cargo rust rustfmt cargo-clippy
+
+jobs:
+  # ── Build ──────────────────────────────────────────────────────────────────
+  # Compiles the full workspace (debug) once on stable and saves the resulting
+  # artifacts to cache. All downstream jobs restore from this cache instead of
+  # recompiling from scratch.
+  build:
+    name: Build
+    runs-on: vdali
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies
+        run: |
+          PKGS="$DNF_PACKAGES"
+          if rpm -q $PKGS >/dev/null 2>&1; then
+            echo "All required packages already installed"
+          else
+            dnf install -y $PKGS
+          fi
+      - uses: actions/checkout@v4
+      - name: Restore cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-v1-
+      - name: Restore cargo git cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/git
+          key: cargo-git-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-git-v1-
+      - name: Build workspace
+        run: ./contrib/ci/local-ci.sh --no-deps build
+      - name: Prune incremental artifacts before caching
+        run: rm -rf target/debug/incremental
+      - name: Save debug build artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/deps
+            target/debug/build
+            target/debug/examples
+          key: cargo-target-debug-stable-v1-${{ github.sha }}
+
+  # ── Format ─────────────────────────────────────────────────────────────────
+  # Runs in parallel with build — rustfmt needs no compiled artifacts.
+  fmt:
+    name: Rustfmt
+    runs-on: vdali
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies
+        run: |
+          PKGS="$DNF_PACKAGES"
+          if rpm -q $PKGS >/dev/null 2>&1; then
+            echo "All required packages already installed"
+          else
+            dnf install -y $PKGS
+          fi
+      - uses: actions/checkout@v4
+      - name: Check formatting
+        run: ./contrib/ci/local-ci.sh --no-deps fmt
+
+  # ── Workflow linting ────────────────────────────────────────────────────────
+  # Validates GitHub Actions workflow YAML; runs in parallel with build.
+  # Uses actionlint when available, falls back to yamllint, skips gracefully
+  # if neither is present.
+  lint-workflows:
+    name: Workflow Lint
+    runs-on: vdali
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies
+        run: |
+          PKGS="$DNF_PACKAGES yamllint"
+          if rpm -q $PKGS >/dev/null 2>&1; then
+            echo "All required packages already installed"
+          else
+            dnf install -y $PKGS
+          fi
+      - uses: actions/checkout@v4
+      - name: Validate GitHub Actions workflow files
+        run: ./contrib/ci/local-ci.sh --no-deps lint-workflows
+
+  # ── Markdown TOC ───────────────────────────────────────────────────────────
+  # Verifies every workspace .md file has an up-to-date doctoc-compatible TOC.
+  # Pure Python — needs no compiled artifacts; runs in parallel with build.
+  toc:
+    name: Markdown TOC
+    runs-on: vdali
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies
+        run: |
+          PKGS="$DNF_PACKAGES"
+          if rpm -q $PKGS >/dev/null 2>&1; then
+            echo "All required packages already installed"
+          else
+            dnf install -y $PKGS
+          fi
+      - uses: actions/checkout@v4
+      - name: Check Markdown table of contents
+        run: ./contrib/ci/local-ci.sh --no-deps toc
+
+  # ── Clippy ─────────────────────────────────────────────────────────────────
+  clippy:
+    name: Clippy
+    needs: [build]
+    runs-on: vdali
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies
+        run: |
+          PKGS="$DNF_PACKAGES"
+          if rpm -q $PKGS >/dev/null 2>&1; then
+            echo "All required packages already installed"
+          else
+            dnf install -y $PKGS
+          fi
+      - uses: actions/checkout@v4
+      - name: Restore cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-v1-
+      - name: Restore debug build artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/deps
+            target/debug/build
+            target/debug/examples
+          key: cargo-target-debug-stable-v1-${{ github.sha }}
+      - name: Run clippy
+        run: ./contrib/ci/local-ci.sh --no-deps clippy
+
+  # ── Documentation ──────────────────────────────────────────────────────────
+  doc:
+    name: Documentation
+    needs: [build]
+    runs-on: vdali
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies
+        run: |
+          PKGS="$DNF_PACKAGES"
+          if rpm -q $PKGS >/dev/null 2>&1; then
+            echo "All required packages already installed"
+          else
+            dnf install -y $PKGS
+          fi
+      - uses: actions/checkout@v4
+      - name: Restore cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-v1-
+      - name: Restore debug build artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/deps
+            target/debug/build
+            target/debug/examples
+          key: cargo-target-debug-stable-v1-${{ github.sha }}
+      - name: Build documentation
+        run: ./contrib/ci/local-ci.sh --no-deps doc
+
+  # ── Rust documentation samples ─────────────────────────────────────────────
+  # Type-checks every Rust code block in docs/ via a temporary Cargo project
+  # that depends on kurbu5-kdb-rs as a path dependency.  The shared target/
+  # directory lets cargo reuse the already-compiled rlibs from the build cache.
+  doc-rust:
+    name: Rust Doc Samples
+    needs: [build]
+    runs-on: vdali
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies
+        run: |
+          PKGS="$DNF_PACKAGES"
+          if rpm -q $PKGS >/dev/null 2>&1; then
+            echo "All required packages already installed"
+          else
+            dnf install -y $PKGS
+          fi
+      - uses: actions/checkout@v4
+      - name: Restore cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-v1-
+      - name: Restore debug build artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/deps
+            target/debug/build
+            target/debug/examples
+          key: cargo-target-debug-stable-v1-${{ github.sha }}
+      - name: Validate Rust documentation samples
+        run: ./contrib/ci/local-ci.sh --no-deps doc-rust
+
+  # ── Test suite ─────────────────────────────────────────────────────────────
+  test:
+    name: Test Suite
+    needs: [build]
+    runs-on: vdali
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies
+        run: |
+          PKGS="$DNF_PACKAGES"
+          if rpm -q $PKGS >/dev/null 2>&1; then
+            echo "All required packages already installed"
+          else
+            dnf install -y $PKGS
+          fi
+      - uses: actions/checkout@v4
+      - name: Restore cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-v1-
+      - name: Restore build artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/deps
+            target/debug/build
+            target/debug/examples
+          key: cargo-target-debug-stable-v1-${{ github.sha }}
+      - name: Run tests
+        run: ./contrib/ci/local-ci.sh --no-deps test

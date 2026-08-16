@@ -1,0 +1,20 @@
+# kurbu5 crate publish order — one workspace-relative crate path per line.
+#
+# Rules:
+#   - Lines starting with # and blank lines are ignored.
+#   - Each entry is the path from the workspace root to a crate directory.
+#   - Package name is derived from the directory basename (must match [package]
+#     name in that crate's Cargo.toml).
+#   - CHANGELOG.md is expected at {path}/CHANGELOG.md.
+#   - Order is strict dependency order: every crate must appear after all
+#     crates it depends on within this workspace.
+
+kurbu5-sys
+kurbu5-derive
+kurbu5-rs
+kurbu5-kdb/kurbu5-kdb-sys
+kurbu5-kdb/kurbu5-kdb-derive
+kurbu5-kdb/kurbu5-kdb-rs
+kadm5/kurbu5-kadm5-sys
+kadm5/kurbu5-kadm5-derive
+kadm5/kurbu5-kadm5-rs
