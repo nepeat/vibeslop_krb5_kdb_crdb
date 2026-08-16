@@ -723,3 +723,76 @@ need ingress rules on BOTH sides); established flows outlive new
 policies by ~30-50s (poll peer dials for enforcement, don't sleep);
 and rapid label/policy churn leaves stale state (apply one partition
 per run). kadmin -q exit codes are not acks — only reply text is.
+
+## 2026-08-16: adversarial correctness pass — 5 bugs found & fixed (rename was a minefield)
+
+Method: theorized ~10 data-safety edge cases from a close read of
+lib/store/marshal, wrote failing repros first, fixed, kept the repros as
+regression tests. cargo 21/21; full e2e green (TGS gate 6971/s;
+listprincs 10280/s — snapshot pinning didn't hurt paging).
+
+**CONFIRMED + FIXED** (each repro'd failing before the fix):
+- **rename TOCTOU cpw loss** (lib.rs/store.rs): entry blob was read in a
+  separate txn BEFORE the rename txn; a cpw landing between read and
+  commit was silently reverted under the new name (repro: old kvno
+  survived the rename; retry loop replayed the same stale blob). Fix:
+  store::rename_principal now takes a rewrite closure and reads the
+  source row INSIDE the serializable txn — a conflicting write forces a
+  40001 retry that re-reads fresh. Regression test injects a cpw from a
+  second connection inside the rewrite window (proves the retry path).
+- **rename target clobber** (store.rs): target row was UPSERTed —
+  renaming onto an existing principal silently destroyed it. Now INSERT
+  + 23505→EEXIST (libkdb5 checks KRB5_KDB_INUSE first; ours is the
+  race-free backstop). Test: victim row asserted byte-identical after.
+- **rename salt breakage — the big one** (lib.rs/marshal.rs): found
+  LIVE by the new e2e renprinc stanza: after `renprinc renate renate2`,
+  kinit renate2 failed "Password incorrect". Root cause: NORMAL-salt
+  keys are string-to-key'd with a salt derived from the principal NAME
+  (realm+components); implementing the rename vtable slot bypasses
+  krb5_db_def_rename_principal, whose krb5_dbe_specialize_salt pins
+  old-name salts explicitly before the swap (verified against MIT
+  1.22.2 source). marshal::specialize_salts mirrors it exactly:
+  no-salt-slot/NORMAL → explicit SPECIAL realm‖comps of the OLD name,
+  NOREALM → comps, ONLYREALM → realm, SPECIAL kept, V4/AFS3 refused
+  (KRB5_KDB_BAD_SALTTYPE equivalent). Every rename before this entry
+  silently bricked password auth for the renamed principal (-randkey/
+  keytab principals unaffected — no password to salt). e2e now proves
+  the pre-rename password still kinits after renprinc.
+- **torn dump snapshot** (store.rs): iterate_principals paged 512 rows
+  per separate implicit txn; a rename moving a row from ahead of the
+  cursor to behind it mid-scan made it vanish from kdb5_util dump
+  (repro: 599/600 seen → silent backup loss). Fix: whole scan pinned
+  AS OF SYSTEM TIME at one cluster_logical_timestamp (ts sanity-checked
+  before interpolation; GC-TTL gives hours of headroom). Test renames
+  mid-iteration via a second connection and asserts 600/600.
+- **realm_of quoting bug** (lib.rs): component ending in a literal
+  backslash unparses as "...\\@REALM"; the reverse scan saw '\' before
+  '@' and returned realm "" → alias referral gate could misjudge. Fixed
+  with a forward scan tracking escape state; unit tests cover trailing
+  backslash + escaped-@ mixes.
+
+**REFUTED with evidence**:
+- SQL metacharacters/unicode in names: every query is parameterized
+  ($1), match_entry glob is ignored (libkdb5 refilters). Live:
+  addprinc/getprinc/listprincs/delprinc of `we%ird_p\\rinc` and a
+  Devanagari name all clean; globs don't leak SQL wildcards.
+- alias cycles/self-alias: resolution is structurally one hop
+  (get_alias then plain get_principal); live SQL cycle rows + getprinc
+  → instant "Principal does not exist", no hang/crash.
+- negative caching: EntryCache.put only runs on a DB hit; misses never
+  cached (create→immediate kinit safe; also covered by the sea1 safety
+  suite's create/delete flap).
+- panics on error paths: unwrap/expect only under #[cfg(test)].
+  Row::get panics only on schema-type mismatch — unreachable while
+  schema.sql's NOT NULL types hold (follow-up: try_get for depth).
+- y2038: timestamps round-trip Timestamp→i32→Timestamp bit-for-bit;
+  MIT treats krb5_timestamp as unsigned since 1.11. No truncation.
+
+Known seam re-noted, not pursued: reconnect-replay ack ambiguity (a
+committed-then-connection-died DELETE/rename replays as NoEntry) — same
+exactly-once-ack class as the kadmin timeout seam documented earlier.
+
+Follow-ups recommended: switch Row::get → try_get (defense in depth);
+send specialize_salts note upstream with the kurbu5 patches (the trait
+docs don't mention the salt contract — anyone implementing rename hits
+bug #3); consider caching alias-resolved entries (perf only).
