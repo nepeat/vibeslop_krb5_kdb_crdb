@@ -607,3 +607,40 @@ touched).
   the kdc_node ansible task now passes it too. Full aarch64 kdc-image
   builds under emulation (~50 min, mostly rustc; both arches 29MB
   compressed) and smoke-runs via docker --platform linux/arm64.
+
+## 2026-08-16: AWS 3-region burn #2 — containerized ansible validated, READ NUMBERS IN
+
+Fleet: 9 spot nodes (c8g.xlarge use1/usw2, c7g.xlarge use2 per the
+pool-diversity lesson), arm64, ~$0.51/hr. tofu plan+apply (56/56) →
+site.yml end to end WITH the new containerized KDC flow: podman
+quadlets, nix-built arm64 image (cross-built on the x86 controller
+under qemu binfmt), realm bootstrap + admin principal fully automatic.
+One live bug found+fixed: YAML >- folding in the smoke test (deeper-
+indented continuation kept its newline → principal-less kinit → root@).
+Deploy otherwise clean; per-node kinit smoke green on all 3 KDCs.
+
+**WRITE (kadmin.local in-container on the use1 KDC node, GLOBAL tables):**
+| config | result |
+|---|---|
+| serial, defaults | 810 ms/create |
+| 32 workers, defaults | 37.2/s |
+| 32 workers, lead override 25ms | 704/s |
+| full 262,144 load, 128 workers, override | **2,194/s (119.5s)** |
+Row count verified 263,513; override RESET after. (Burn #1: 984ms /
+38/s / 826/s / 3,241/s — same physics; full-load delta is client-side:
+128 kadmin.local processes shared one 4-vCPU node with KDC + CRDB.)
+
+**READ (the missing number): tgsbench from 2 sibling nodes per region,
+48 threads x 2000 reqs each, ip:10.100 over the 262k dataset:**
+| region | per-KDC TGS/s (2 clients summed) |
+|---|---|
+| us-west-2 (c8g) | 7,205 |
+| us-east-1 (c8g) | 6,056 |
+| us-east-2 (c7g) | 4,864 |
+| **3-region aggregate** | **~18,100/s** |
+1,152,000 requests total across both runs, err=0. Each KDC is 4 vCPU
+(-w 8, entry_cache_ms=1000) ALSO hosting a CRDB node — per-core this
+beats the sea1 numbers. c7g region consistently ~30% slower (Graviton3
+vs 4); use1/usw2 swapped ranks between runs (noise), c7g last in both.
+
+Infra still RUNNING at entry time (teardown decision pending user).
