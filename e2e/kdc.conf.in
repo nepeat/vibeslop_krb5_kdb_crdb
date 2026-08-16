@@ -1,0 +1,40 @@
+# KDC/kadmind profile for the e2e test realm. Rendered by run.sh.
+# Unprivileged ports so no root is needed.
+
+[kdcdefaults]
+    kdc_ports = 10088
+    kdc_tcp_ports = 10088
+
+[realms]
+    EXAMPLE.COM = {
+        database_module = crdb
+        acl_file = @STATE@/kadm5.acl
+        key_stash_file = @STATE@/master.stash
+        kadmind_port = 10749
+        kpasswd_port = 10464
+        max_life = 10h 0m 0s
+        max_renewable_life = 7d 0h 0m 0s
+    }
+
+[dbmodules]
+    # libkdb5 does not honor plugin_base_dir; KDB modules load from here.
+    db_module_dir = @PLUGINS@/kdb
+    crdb = {
+        db_library = kdb_crdb
+        # verify-full TLS + client-cert auth: no secret in this file.
+        connection_uri = postgresql://krb5kdc@localhost:26257/krb5?sslmode=verify-full&sslrootcert=@CERTS@/ca.crt&sslcert=@CERTS@/client.krb5kdc.crt&sslkey=@CERTS@/client.krb5kdc.key
+        # Non-negotiable for the GLOBAL-table design (see README):
+        disable_last_success = true
+        disable_lockout = true
+        # KDC-role read cache TTL in ms (default 1000; 0 = off). Bounds
+        # how late a key change reaches a KDC worker; kadmind never caches.
+        entry_cache_ms = 1000
+        # Degraded-read fallback (KDC role only): when CRDB loses quorum,
+        # serve auth from bounded-staleness follower reads up to this old.
+        stale_reads_ms = 30000
+    }
+
+[logging]
+    kdc = FILE:@STATE@/kdc.log
+    admin_server = FILE:@STATE@/kadmind.log
+    default = FILE:@STATE@/krb5.log

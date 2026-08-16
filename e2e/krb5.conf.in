@@ -1,0 +1,16 @@
+# Client-side profile for the e2e test realm. Rendered by run.sh
+# (@STATE@ / @PLUGINS@ substituted) into e2e/.state/krb5.conf.
+
+[libdefaults]
+    default_realm = EXAMPLE.COM
+    plugin_base_dir = @PLUGINS@
+    dns_lookup_kdc = false
+    dns_lookup_realm = false
+    rdns = false
+
+[realms]
+    EXAMPLE.COM = {
+        kdc = 127.0.0.1:10088
+        admin_server = 127.0.0.1:10749
+        kpasswd_server = 127.0.0.1:10464
+    }
