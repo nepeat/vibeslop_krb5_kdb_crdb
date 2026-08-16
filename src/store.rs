@@ -436,53 +436,90 @@ impl Store {
     }
 
     /// Atomic rename: the wire blob embeds the canonical principal name, so
-    /// the caller re-encodes it and we swap rows in one transaction. Strong
-    /// consistency means no region can observe both or neither name.
+    /// `rewrite` re-encodes it under the new name. Strong consistency means
+    /// no region can observe both or neither name.
+    ///
+    /// The source row is read INSIDE the transaction (a pre-read blob would
+    /// silently revert a cpw that lands between read and commit — the
+    /// conflict now surfaces as a 40001 retry that re-reads fresh), and the
+    /// target is INSERTed, not upserted: renaming onto an existing
+    /// principal is EEXIST, never a silent overwrite. Read-then-delete also
+    /// keeps the old invariant: a missing source ends the txn with nothing
+    /// visible (no phantom target row).
     pub fn rename_principal(
         &self,
         old: &str,
         new: &str,
-        new_blob: &[u8],
+        rewrite: impl Fn(&[u8]) -> Result<Vec<u8>, KdbError>,
     ) -> Result<(), KdbError> {
-        // Delete first: if the source row doesn't exist the txn must end
-        // WITHOUT the upsert becoming visible. (Upsert-then-delete commits
-        // a phantom target row when the source is missing — found the hard
-        // way, as a stray row that resurfaced through dump/load.)
-        let renamed = self.with_retry(|c| {
+        self.with_retry(|c| {
             let mut txn = c.client.transaction()?;
-            let n = txn
-                .execute("DELETE FROM principals WHERE name = $1", &[&old])?;
-            if n == 0 {
+            let Some(row) = txn.query_opt(
+                "SELECT entry FROM principals WHERE name = $1",
+                &[&old],
+            )?
+            else {
                 txn.rollback()?;
-                return Ok(false);
-            }
-            txn.execute(
-                "UPSERT INTO principals (name, entry, updated_at) \
+                return Ok(Err(KdbError::NoEntry));
+            };
+            let entry: Vec<u8> = row.get(0);
+            let new_blob = match rewrite(&entry) {
+                Ok(b) => b,
+                Err(e) => {
+                    txn.rollback()?;
+                    return Ok(Err(e));
+                }
+            };
+            txn.execute("DELETE FROM principals WHERE name = $1", &[&old])?;
+            match txn.execute(
+                "INSERT INTO principals (name, entry, updated_at) \
                  VALUES ($1, $2, now())",
                 &[&new, &new_blob],
-            )?;
+            ) {
+                Ok(_) => {}
+                Err(e) if e.code().map(|c| c.code()) == Some("23505") => {
+                    // Aborted txn; dropping it rolls back.
+                    return Ok(Err(KdbError::Custom(libc::EEXIST)));
+                }
+                Err(e) => return Err(e),
+            }
             txn.commit()?;
-            Ok(true)
-        })?;
-        if renamed { Ok(()) } else { Err(KdbError::NoEntry) }
+            Ok(Ok(()))
+        })?
     }
 
     /// Full scan for kdb5_util dump / kadmin listprincs. Paged so a large
-    /// realm doesn't hold one enormous result set (and CRDB follower reads
-    /// keep this cheap even mid-write-load).
+    /// realm doesn't hold one enormous result set, and pinned to ONE
+    /// timestamp: each page is otherwise its own implicit txn, and a
+    /// concurrent rename that moves a row from ahead of the cursor to
+    /// behind it silently drops the principal from the dump (backup data
+    /// loss). AS OF SYSTEM TIME makes the scan a consistent snapshot; a
+    /// dump has hours of GC-TTL headroom, and follower reads keep pages
+    /// cheap even mid-write-load.
     pub fn iterate_principals(
         &self,
         mut cb: impl FnMut(&[u8]) -> Result<(), KdbError>,
     ) -> Result<(), KdbError> {
+        let ts: String = self.with_retry(|c| {
+            let row = c
+                .client
+                .query_one("SELECT cluster_logical_timestamp()::string", &[])?;
+            Ok(row.get(0))
+        })?;
+        // The timestamp comes from CRDB itself, but it is interpolated into
+        // SQL (AS OF SYSTEM TIME takes no placeholder), so sanity-check it.
+        if !ts.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+            return Err(KdbError::Custom(libc::EIO));
+        }
+        let sql = format!(
+            "SELECT name, entry FROM principals AS OF SYSTEM TIME '{ts}' \
+             WHERE name > $1 ORDER BY name LIMIT 512"
+        );
         let mut last = String::new();
         loop {
             let rows: Vec<Vec<u8>> = self.with_retry(|c| {
-                let stmt = c.stmt(
-                    "SELECT name, entry FROM principals \
-                     WHERE name > $1 ORDER BY name LIMIT 512",
-                )?;
                 Ok(c.client
-                    .query(&stmt, &[&last])?
+                    .query(sql.as_str(), &[&last])?
                 .into_iter()
                 .map(|r| {
                     last = r.get::<_, String>(0);
@@ -805,13 +842,15 @@ mod tests {
         let blob = postcard::to_allocvec(&entry).unwrap();
         store.put_principal(&old, &blob).unwrap();
 
-        // Mirror lib.rs::rename_principal: rewrite the embedded name first.
-        let mut wire =
-            marshal::decode_wire(&store.get_principal(&old).unwrap().unwrap())
-                .unwrap();
-        wire.princ_name = new.clone();
-        let new_blob = postcard::to_allocvec(&wire).unwrap();
-        store.rename_principal(&old, &new, &new_blob).unwrap();
+        // Mirror lib.rs::rename_principal: rewrite the embedded name in
+        // the txn-side closure.
+        store
+            .rename_principal(&old, &new, |blob| {
+                let mut wire = marshal::decode_wire(blob)?;
+                wire.princ_name = new.clone();
+                Ok(postcard::to_allocvec(&wire).unwrap())
+            })
+            .unwrap();
 
         assert!(store.get_principal(&old).unwrap().is_none());
         let back = marshal::decode_wire(
@@ -827,7 +866,7 @@ mod tests {
         // phantom later resurfaced through dump/load).
         let none_target = uniq("kt-rename-none");
         let err = store
-            .rename_principal(&old, &none_target, &new_blob)
+            .rename_principal(&old, &none_target, |blob| Ok(blob.to_vec()))
             .unwrap_err();
         assert!(matches!(err, KdbError::NoEntry));
         assert!(
@@ -860,6 +899,149 @@ mod tests {
             assert!(seen.contains(name), "iteration missed {name}");
             store.delete_principal(name).unwrap();
         }
+    }
+
+    #[test]
+    fn rename_does_not_lose_concurrent_cpw() {
+        // A cpw racing the rename must never be reverted (regression: the
+        // blob was read OUTSIDE the rename txn, so the rename overwrote
+        // the newer keys with the stale pre-cpw blob). The rewrite closure
+        // runs inside the txn right after the source read, so a conflicting
+        // put injected there is exactly the race window: the txn must hit
+        // 40001, retry, and re-read the fresh keys.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let store = test_store();
+        let store2 = test_store(); // the "concurrent kadmind"
+        let old = uniq("kt-race-old");
+        let new = uniq("kt-race-new");
+        let mut entry = sample_wire_entry(&old);
+        store
+            .put_principal(&old, &postcard::to_allocvec(&entry).unwrap())
+            .unwrap();
+
+        entry.keys[0].kvno = 9;
+        entry.keys[0].key_bytes = vec![0x99; 34];
+        let cpw_blob = postcard::to_allocvec(&entry).unwrap();
+        let injected = AtomicBool::new(false);
+        store
+            .rename_principal(&old, &new, |blob| {
+                if !injected.swap(true, Ordering::SeqCst) {
+                    store2.put_principal(&old, &cpw_blob)?;
+                }
+                let mut wire = marshal::decode_wire(blob)?;
+                wire.princ_name = new.clone();
+                Ok(postcard::to_allocvec(&wire).unwrap())
+            })
+            .unwrap();
+        assert!(injected.load(Ordering::SeqCst));
+
+        let back = marshal::decode_wire(
+            &store.get_principal(&new).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(back.keys[0].kvno, 9, "rename lost a concurrent cpw");
+        assert_eq!(back.princ_name, new);
+        assert!(store.get_principal(&old).unwrap().is_none());
+        store.delete_principal(&new).unwrap();
+    }
+
+    #[test]
+    fn rename_refuses_existing_target() {
+        // Renaming onto an existing principal must fail, not silently
+        // destroy the victim's entry.
+        let store = test_store();
+        let old = uniq("kt-clobber-old");
+        let victim = uniq("kt-clobber-victim");
+        let old_blob =
+            postcard::to_allocvec(&sample_wire_entry(&old)).unwrap();
+        let victim_blob =
+            postcard::to_allocvec(&sample_wire_entry(&victim)).unwrap();
+        store.put_principal(&old, &old_blob).unwrap();
+        store.put_principal(&victim, &victim_blob).unwrap();
+
+        let err = store
+            .rename_principal(&old, &victim, |blob| {
+                let mut wire = marshal::decode_wire(blob)?;
+                wire.princ_name = victim.clone();
+                Ok(postcard::to_allocvec(&wire).unwrap())
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, KdbError::Custom(c) if c == libc::EEXIST),
+            "rename onto an existing principal must be EEXIST, got {err:?}"
+        );
+        assert_eq!(
+            store.get_principal(&victim).unwrap().unwrap(),
+            victim_blob,
+            "rename destroyed the existing target entry"
+        );
+        assert!(
+            store.get_principal(&old).unwrap().is_some(),
+            "failed rename deleted the source"
+        );
+        store.delete_principal(&old).unwrap();
+        store.delete_principal(&victim).unwrap();
+    }
+
+    #[test]
+    fn iteration_snapshot_survives_concurrent_rename() {
+        // A dump must be a consistent snapshot: a principal renamed from
+        // ahead of the cursor to behind it mid-scan must not vanish.
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let store = test_store();
+        let store2 = test_store();
+        let base = format!(
+            "kt-snap-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let name =
+            |i: usize| format!("{base}-{i:04}@EXAMPLE.COM");
+        // 600 contiguous names: the page (512 rows) holding -0001 can never
+        // also hold -0600, so -0600 is fetched by a later page.
+        for i in 1..=600 {
+            let n = name(i);
+            let blob =
+                postcard::to_allocvec(&sample_wire_entry(&n)).unwrap();
+            store.put_principal(&n, &blob).unwrap();
+        }
+
+        let moved_from = name(600);
+        let moved_to = name(0); // sorts before every cursor position
+        let mut renamed = false;
+        let mut seen = Vec::new();
+        store
+            .iterate_principals(|blob| {
+                let n = marshal::decode_wire(blob)?.princ_name;
+                if !renamed && n == name(1) {
+                    // Mid-scan rename via a second connection, exactly the
+                    // window between two page fetches.
+                    store2.rename_principal(&moved_from, &moved_to, |b| {
+                        let mut wire = marshal::decode_wire(b)?;
+                        wire.princ_name = moved_to.clone();
+                        Ok(postcard::to_allocvec(&wire).unwrap())
+                    })?;
+                    renamed = true;
+                }
+                if n.starts_with(&base) {
+                    seen.push(n);
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(renamed, "test setup: trigger row never seen");
+        assert!(
+            seen.contains(&moved_from),
+            "concurrently renamed principal vanished from the dump \
+             (saw {} of 600)",
+            seen.len()
+        );
+
+        for i in 1..=599 {
+            store.delete_principal(&name(i)).unwrap();
+        }
+        let _ = store.delete_principal(&moved_from);
+        let _ = store.delete_principal(&moved_to);
     }
 
     #[test]

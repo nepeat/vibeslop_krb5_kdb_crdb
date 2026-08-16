@@ -150,6 +150,49 @@ pub fn decode_entry(
     Ok(entry)
 }
 
+// krb5 salt types (kdb.h). Only the ones rename cares about.
+pub const SALTTYPE_NORMAL: i16 = 0;
+pub const SALTTYPE_V4: i16 = 1;
+pub const SALTTYPE_NOREALM: i16 = 2;
+pub const SALTTYPE_ONLYREALM: i16 = 3;
+pub const SALTTYPE_SPECIAL: i16 = 4;
+
+/// Store name-derived salts explicitly, mirroring libkdb5's
+/// krb5_dbe_specialize_salt. Keys with the default (NORMAL) salt are
+/// string-to-key'd with a salt DERIVED FROM THE PRINCIPAL NAME
+/// (realm + components, krb5_principal2salt); renaming a principal
+/// without pinning the old salt silently breaks its password forever.
+/// `realm`/`components` are the OLD principal's unquoted fields.
+/// Semantics per MIT: no salt slot (key_data_ver < 2) means NORMAL;
+/// SPECIAL already carries its salt; V4/AFS3 are KRB5_KDB_BAD_SALTTYPE.
+pub fn specialize_salts(
+    wire: &mut WireEntry,
+    realm: &[u8],
+    components: &[&[u8]],
+) -> Result<(), KdbError> {
+    for k in &mut wire.keys {
+        let stype = if k.has_salt { k.salttype } else { SALTTYPE_NORMAL };
+        let salt = match stype {
+            SALTTYPE_NORMAL => {
+                let mut s = realm.to_vec();
+                for c in components {
+                    s.extend_from_slice(c);
+                }
+                s
+            }
+            SALTTYPE_NOREALM => components.concat(),
+            SALTTYPE_ONLYREALM => realm.to_vec(),
+            SALTTYPE_SPECIAL => continue,
+            // V4/AFS3/unknown: refuse, exactly like krb5_dbe_compute_salt.
+            _ => return Err(KdbError::Custom(libc::EINVAL)),
+        };
+        k.salttype = SALTTYPE_SPECIAL;
+        k.salt_bytes = salt;
+        k.has_salt = true;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Policies
 // ---------------------------------------------------------------------------
@@ -341,6 +384,64 @@ mod tests {
     #[test]
     fn wire_entry_rejects_garbage() {
         assert!(decode_wire(&[0xff; 64]).is_err());
+    }
+
+    #[test]
+    fn specialize_salts_pins_name_derived_salts() {
+        // Rename regression: NORMAL-salt keys are string-to-key'd with
+        // realm+components of the principal NAME; renaming without pinning
+        // the old salt breaks the password (e2e caught it: kinit after
+        // renprinc failed with "Password incorrect").
+        let mut e = sample_wire_entry("alice@EXAMPLE.COM");
+        // key[0]: no salt slot -> effective NORMAL. key[1]: SPECIAL.
+        // Add ONLYREALM and NOREALM variants to cover the other computed
+        // types.
+        e.keys.push(WireKey {
+            has_salt: true,
+            kvno: 2,
+            enctype: 18,
+            salttype: SALTTYPE_ONLYREALM,
+            key_bytes: vec![1; 8],
+            salt_bytes: vec![],
+        });
+        e.keys.push(WireKey {
+            has_salt: true,
+            kvno: 2,
+            enctype: 18,
+            salttype: SALTTYPE_NOREALM,
+            key_bytes: vec![2; 8],
+            salt_bytes: vec![],
+        });
+        let special_before = e.keys[1].clone();
+        let keys_before: Vec<Vec<u8>> =
+            e.keys.iter().map(|k| k.key_bytes.clone()).collect();
+
+        specialize_salts(&mut e, b"EXAMPLE.COM", &[b"host", b"a.example.com"])
+            .unwrap();
+
+        // Every key now carries an explicit SPECIAL salt...
+        for k in &e.keys {
+            assert!(k.has_salt);
+            assert_eq!(k.salttype, SALTTYPE_SPECIAL);
+        }
+        // ...computed from the OLD name fields (principal2salt semantics).
+        // keys[0] and keys[2] have no salt slot -> effective NORMAL.
+        assert_eq!(e.keys[0].salt_bytes, b"EXAMPLE.COMhosta.example.com");
+        assert_eq!(e.keys[2].salt_bytes, b"EXAMPLE.COMhosta.example.com");
+        assert_eq!(e.keys[3].salt_bytes, b"EXAMPLE.COM");
+        assert_eq!(e.keys[4].salt_bytes, b"hosta.example.com");
+        // SPECIAL keys keep their stored salt; key material never changes.
+        assert_eq!(e.keys[1], special_before);
+        let keys_after: Vec<Vec<u8>> =
+            e.keys.iter().map(|k| k.key_bytes.clone()).collect();
+        assert_eq!(keys_before, keys_after);
+
+        // V4/AFS3 salts cannot be specialized: refuse like MIT's
+        // KRB5_KDB_BAD_SALTTYPE rather than corrupting them.
+        let mut bad = sample_wire_entry("v4@EXAMPLE.COM");
+        bad.keys[0].has_salt = true;
+        bad.keys[0].salttype = SALTTYPE_V4;
+        assert!(specialize_salts(&mut bad, b"R", &[b"v4"]).is_err());
     }
 
     #[test]

@@ -162,6 +162,29 @@ if echo x | kinit ghost 2>/dev/null; then
 fi
 echo "OK: in-realm aliases resolve (TGS + AS -C); out-of-realm gated on REFERRAL_OK"
 
+say "renprinc: atomic rename, keys survive, no clobber of existing targets"
+# Exercises the rename txn (read + rewrite + swap inside one serializable
+# txn — see store.rs::rename_principal) through real kadmind RPC.
+kadmin -p admin/admin -w "$ADMIN_PW" -q "addprinc -pw ren-pw renate" >/dev/null
+kadmin -p admin/admin -w "$ADMIN_PW" -q "renprinc -force renate renate2"
+echo ren-pw | kinit renate2 # same password: key data survived the rename
+kdestroy
+if echo ren-pw | kinit renate 2>/dev/null; then
+    echo "FAIL: old name still authenticates after renprinc" >&2
+    exit 1
+fi
+# Renaming onto an existing principal must be refused (kadm5 checks dups,
+# and the backend independently returns EEXIST instead of clobbering).
+kadmin -p admin/admin -w "$ADMIN_PW" -q "renprinc -force renate2 alice" \
+    2>/dev/null || true
+echo "$ALICE_PW" | kinit alice # victim entry intact (kadmin acks lie; kinit is truth)
+kdestroy
+[ "$(psql -tA "$CRDB_URI_ROOT" -c \
+    "SELECT count(*) FROM principals WHERE name IN ('renate2@$REALM', 'alice@$REALM')")" = 2 ] ||
+    { echo "FAIL: rename-onto-existing lost a principal row" >&2; exit 1; }
+kadmin -p admin/admin -w "$ADMIN_PW" -q "delprinc -force renate2" >/dev/null
+echo "OK: renprinc renames atomically and refuses to overwrite"
+
 say "backend validation: TLS is enforced (plaintext SQL is rejected)"
 if psql "postgresql://root:root-dev-pw@localhost:26257/krb5?sslmode=disable" \
     -c 'SELECT 1' >/dev/null 2>&1; then

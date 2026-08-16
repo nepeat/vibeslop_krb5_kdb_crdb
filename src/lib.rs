@@ -317,23 +317,31 @@ impl KdbModule for CrdbKdb {
     ) -> Result<(), KdbError> {
         let old = self.canonical_name(ctx, source)?;
         let new = self.canonical_name(ctx, target)?;
-
-        // The blob embeds the canonical name, so rewrite it before the swap.
-        // (kadmind refreshes KRB5_TL_MOD_PRINC on its own next write.)
-        let blob = self.store.get_principal(&old)?.ok_or(KdbError::NoEntry)?;
-        let mut wire = marshal::decode_wire(&blob)?;
-        wire.princ_name = new.clone();
-        let new_blob = postcard::to_allocvec(&wire)
-            .map_err(|_| KdbError::OutOfMemory)?;
+        // Old name's raw fields, for pinning name-derived salts below.
+        let old_realm = source.realm().to_vec();
+        let old_comps: Vec<Vec<u8>> =
+            source.components().map(<[u8]>::to_vec).collect();
 
         // Single serializable txn: no observer in any region can see both
-        // names or neither. This is the kind of invariant the whole
-        // strongly-consistent design exists for.
+        // names or neither. The blob embeds the canonical name; the store
+        // reads it INSIDE the txn and this closure rewrites it, so a cpw
+        // racing the rename retries instead of being reverted. Default
+        // (NORMAL) salts derive from the principal name, so they must be
+        // made explicit under the OLD name or passwords break — same as
+        // krb5_db_def_rename_principal's specialize_salt step. (kadmind
+        // refreshes KRB5_TL_MOD_PRINC on its own next write.)
         if let Some(cache) = &self.cache {
             cache.invalidate(&old);
             cache.invalidate(&new);
         }
-        self.store.rename_principal(&old, &new, &new_blob)
+        self.store.rename_principal(&old, &new, |blob| {
+            let mut wire = marshal::decode_wire(blob)?;
+            wire.princ_name = new.clone();
+            let comps: Vec<&[u8]> =
+                old_comps.iter().map(Vec::as_slice).collect();
+            marshal::specialize_salts(&mut wire, &old_realm, &comps)?;
+            postcard::to_allocvec(&wire).map_err(|_| KdbError::OutOfMemory)
+        })
     }
 
     fn iterate_principals(
