@@ -1,0 +1,43 @@
+[package]
+name = "kdb-crdb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "MIT Kerberos KDB backend on CockroachDB GLOBAL tables (strongly consistent, multi-region)"
+
+[lib]
+# libkdb5 dlopen()s this; the kdb_plugin! macro exports `kdb_function_table`.
+name = "kdb_crdb"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Verified against kurbu5 0.1.2 (targets KDB DAL major version 9, krb5 >= 1.21)
+kurbu5-kdb-rs = { git = "https://codeberg.org/abbra/kurbu5.git", tag = "v0.1.2" }
+
+# Sync client on purpose: the KDB vtable is synchronous C calls and both
+# krb5kdc and kadmind drive the DAL from a single thread per process.
+# (kurbu5's async KdbModule support is on their roadmap, not here yet.)
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
+# TLS for production CRDB clusters (sslmode=verify-full):
+postgres-native-tls = "0.5"
+native-tls = "0.2"
+# Already in the tree via native-tls; used directly to re-encode PKCS#1
+# client keys (cockroach cert output) as the PKCS#8 native-tls requires.
+openssl = "0.10"
+
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+libc = "0.2"
+
+# Vendored kurbu5 main (commit in vendor/kurbu5/.vendored-commit, currently
+# b52c19e / post-0.1.3) + two additive accessor patches (see patches/):
+#   0001: PolicyEntry::tl_data() getter — policy TL-data round-trip
+#   0002: KeyDataRef::key_data_ver()/has_salt() — exact salt-slot fidelity
+# Drop this section once both land upstream and the tag is bumped.
+[patch."https://codeberg.org/abbra/kurbu5.git"]
+kurbu5-kdb-rs = { path = "vendor/kurbu5/kurbu5-kdb/kurbu5-kdb-rs" }
+
+[profile.release]
+lto = "thin"
+panic = "abort"   # never unwind across the C vtable boundary
