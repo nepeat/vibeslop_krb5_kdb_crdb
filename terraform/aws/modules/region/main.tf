@@ -120,6 +120,41 @@ resource "aws_security_group" "nodes" {
     cidr_blocks = var.mesh_cidrs
   }
   ingress {
+    description = "Kerberos KDC, mesh-internal only"
+    from_port   = 88
+    to_port     = 88
+    protocol    = "tcp"
+    cidr_blocks = var.mesh_cidrs
+  }
+  ingress {
+    description = "Kerberos KDC UDP, mesh-internal only"
+    from_port   = 88
+    to_port     = 88
+    protocol    = "udp"
+    cidr_blocks = var.mesh_cidrs
+  }
+  ingress {
+    description = "kadmind, mesh-internal only"
+    from_port   = 749
+    to_port     = 749
+    protocol    = "tcp"
+    cidr_blocks = var.mesh_cidrs
+  }
+  ingress {
+    description = "kpasswd, mesh-internal only"
+    from_port   = 464
+    to_port     = 464
+    protocol    = "tcp"
+    cidr_blocks = var.mesh_cidrs
+  }
+  ingress {
+    description = "kpasswd UDP, mesh-internal only"
+    from_port   = 464
+    to_port     = 464
+    protocol    = "udp"
+    cidr_blocks = var.mesh_cidrs
+  }
+  ingress {
     description = "ICMP inside mesh"
     from_port   = -1
     to_port     = -1

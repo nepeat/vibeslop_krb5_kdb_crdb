@@ -19,6 +19,16 @@ resource "local_file" "ansible_inventory" {
     [crdb:vars]
     ansible_user=ubuntu
     ansible_ssh_common_args=-o StrictHostKeyChecking=accept-new
+
+    # One KDC per region, colocated on the region's first CRDB node.
+    [kdc]
+    %{~for r in distinct([for n in local.all_nodes : n.region])~}
+    ${[for n in local.all_nodes : n.name if n.region == r][0]}
+    %{~endfor~}
+
+    [kdc:vars]
+    ansible_user=ubuntu
+    ansible_ssh_common_args=-o StrictHostKeyChecking=accept-new
   EOT
 }
 
