@@ -15,7 +15,8 @@
 //! transaction inside the same loop.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use kurbu5_kdb_rs::KdbError;
@@ -56,6 +57,80 @@ impl Conn {
     }
 }
 
+/// Every table-touching statement a Store issues, spelled out per table
+/// set. A replica-mode `kdb5_util load` opens the database with the
+/// `temporary` db_arg and must land in the staging tables — the live
+/// GLOBAL tables keep serving every region's KDCs until promote_db.
+/// Static strings so the prepared-statement cache keys stay `&'static`.
+struct SqlSet {
+    get_principal: &'static str,
+    put_principal: &'static str,
+    delete_principal: &'static str,
+    rename_select: &'static str,
+    rename_delete: &'static str,
+    rename_insert: &'static str,
+    get_policy: &'static str,
+    put_policy: &'static str,
+    create_policy: &'static str,
+    delete_policy: &'static str,
+    iterate_policies: &'static str,
+    /// For dynamically-built SQL (paged principal iteration).
+    principals_table: &'static str,
+}
+
+static LIVE_SQL: SqlSet = SqlSet {
+    get_principal: "SELECT entry FROM principals WHERE name = $1",
+    put_principal: "UPSERT INTO principals (name, entry, updated_at) \
+                    VALUES ($1, $2, now())",
+    delete_principal: "DELETE FROM principals WHERE name = $1",
+    rename_select: "SELECT entry FROM principals WHERE name = $1",
+    rename_delete: "DELETE FROM principals WHERE name = $1",
+    rename_insert: "INSERT INTO principals (name, entry, updated_at) \
+                    VALUES ($1, $2, now())",
+    get_policy: "SELECT entry FROM policies WHERE name = $1",
+    put_policy: "UPSERT INTO policies (name, entry, updated_at) \
+                 VALUES ($1, $2, now())",
+    create_policy: "INSERT INTO policies (name, entry) VALUES ($1, $2)",
+    delete_policy: "DELETE FROM policies WHERE name = $1",
+    iterate_policies: "SELECT entry FROM policies ORDER BY name",
+    principals_table: "principals",
+};
+
+static STAGING_SQL: SqlSet = SqlSet {
+    get_principal: "SELECT entry FROM principals_staging WHERE name = $1",
+    put_principal: "UPSERT INTO principals_staging (name, entry, updated_at) \
+                    VALUES ($1, $2, now())",
+    delete_principal: "DELETE FROM principals_staging WHERE name = $1",
+    rename_select: "SELECT entry FROM principals_staging WHERE name = $1",
+    rename_delete: "DELETE FROM principals_staging WHERE name = $1",
+    rename_insert: "INSERT INTO principals_staging (name, entry, updated_at) \
+                    VALUES ($1, $2, now())",
+    get_policy: "SELECT entry FROM policies_staging WHERE name = $1",
+    put_policy: "UPSERT INTO policies_staging (name, entry, updated_at) \
+                 VALUES ($1, $2, now())",
+    create_policy: "INSERT INTO policies_staging (name, entry) \
+                    VALUES ($1, $2)",
+    delete_policy: "DELETE FROM policies_staging WHERE name = $1",
+    iterate_policies: "SELECT entry FROM policies_staging ORDER BY name",
+    principals_table: "principals_staging",
+};
+
+/// Receiver lease identity: unique across hosts (pid + epoch nanos),
+/// stable within a process. kdb5_util load runs create → puts →
+/// promote_db in ONE process (verified against MIT 1.22.2), and
+/// promote_db is a static vtable call that re-opens its own Store — this
+/// process-global is how it re-derives the identity the load took the
+/// lease under.
+fn lease_holder_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        format!("pid{}-{nanos:x}", std::process::id())
+    })
+}
+
 /// TLS choice, decided once from the URI at connect time and reused on
 /// reconnect. Anything other than an explicit `sslmode=disable` gets a
 /// *verifying* TLS connector: certificate chain AND hostname are always
@@ -79,6 +154,14 @@ pub struct StoreOpts {
     /// Last-known-good cache; Some() also means a DB-less start is
     /// survivable instead of fatal (KDC role only — lib.rs gates that).
     pub offline: Option<OfflineCache>,
+    /// Route ALL principal/policy statements to the staging tables (a
+    /// gated `kdb5_util load`). Staging writes are never freeze-checked:
+    /// they cannot touch live data by construction.
+    pub staging: bool,
+    /// This handle IS the replica-mode receiver (gates verified by the
+    /// caller): exempt from the replica write-freeze so kpropd's iprop
+    /// incremental applies and promote_db's swap can write live tables.
+    pub receiver: bool,
 }
 
 pub struct Store {
@@ -113,6 +196,16 @@ pub struct Store {
     /// straight through to the offline cache.
     connect_hold_until: Mutex<Option<Instant>>,
     offline: Option<OfflineCache>,
+    /// Which table set this handle addresses (live vs staging).
+    sql: &'static SqlSet,
+    /// See StoreOpts::staging / StoreOpts::receiver. `receiver` is
+    /// atomic because lib.rs flips it after open once the prop_control
+    /// marker has been verified (the store must exist to check it).
+    staging: bool,
+    receiver: AtomicBool,
+    /// Staged puts since open; every LEASE_EXTEND_EVERY of them extends
+    /// the receiver lease so a huge dump cannot outlive it mid-load.
+    staged_puts: AtomicU64,
 }
 
 /// Fail primary statements fast when the fallback exists; quorum-less
@@ -129,6 +222,15 @@ const CONNECT_BACKOFF_MAX_MS: u64 = 2000;
 const REQUEST_RETRY_CAP_MS: u64 = 2000;
 /// While disconnected, re-probe the DB at most this often.
 const CONNECT_HOLD_MS: u64 = 5000;
+/// Receiver lease TTL and how often a staged load renews it. A 262k-row
+/// dump stages in about a minute at regional write speed; 15 minutes is
+/// generous, and renewal every 8k puts keeps even a multi-million-row
+/// load safely inside it.
+const LEASE_TTL: &str = "15 minutes";
+const LEASE_EXTEND_EVERY: u64 = 8192;
+/// Rows per promote/clear batch: big enough to amortize the GLOBAL
+/// commit-wait, small enough to stay far from txn size limits.
+const PROMOTE_BATCH: i64 = 512;
 
 /// KRB5KDC_ERR_SVC_UNAVAILABLE (krb5.h: ERROR_TABLE_BASE_krb5 + 29).
 /// Spelled out because kurbu5 does not re-export the krb5 error table;
@@ -352,6 +454,10 @@ impl Store {
                 .min(REQUEST_RETRY_CAP_MS),
             connect_hold_until: Mutex::new(None),
             offline: opts.offline,
+            sql: if opts.staging { &STAGING_SQL } else { &LIVE_SQL },
+            staging: opts.staging,
+            receiver: AtomicBool::new(opts.receiver),
+            staged_puts: AtomicU64::new(0),
         })
     }
 
@@ -594,10 +700,7 @@ impl Store {
         // Falls back to a bounded-staleness read when quorum is gone, and
         // — only if the DB is unreachable outright — to the offline
         // last-known-good cache underneath that.
-        let got = self.read_with_fallback::<Vec<u8>>(
-            "SELECT entry FROM principals WHERE name = $1",
-            name,
-        );
+        let got = self.read_with_fallback::<Vec<u8>>(self.sql.get_principal, name);
         let Some(cache) = &self.offline else { return got };
         match got {
             Ok(Some(blob)) => {
@@ -643,20 +746,25 @@ impl Store {
         name: &str,
         blob: &[u8],
     ) -> Result<(), KdbError> {
+        self.ensure_writes_allowed()?;
         self.with_retry(|c| {
-            let stmt = c.stmt(
-                "UPSERT INTO principals (name, entry, updated_at) \
-                 VALUES ($1, $2, now())",
-            )?;
+            let stmt = c.stmt(self.sql.put_principal)?;
             c.client.execute(&stmt, &[&name, &blob])?;
             Ok(())
-        })
+        })?;
+        if self.staging {
+            let n = self.staged_puts.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % LEASE_EXTEND_EVERY == 0 {
+                self.extend_prop_lease()?;
+            }
+        }
+        Ok(())
     }
 
     pub fn delete_principal(&self, name: &str) -> Result<(), KdbError> {
+        self.ensure_writes_allowed()?;
         let n = self.with_retry(|c| {
-            let stmt =
-                c.stmt("DELETE FROM principals WHERE name = $1")?;
+            let stmt = c.stmt(self.sql.delete_principal)?;
             c.client.execute(&stmt, &[&name])
         })?;
         if n == 0 { Err(KdbError::NoEntry) } else { Ok(()) }
@@ -679,12 +787,11 @@ impl Store {
         new: &str,
         rewrite: impl Fn(&[u8]) -> Result<Vec<u8>, KdbError>,
     ) -> Result<(), KdbError> {
+        self.ensure_writes_allowed()?;
         self.with_retry(|c| {
             let mut txn = c.client.transaction()?;
-            let Some(row) = txn.query_opt(
-                "SELECT entry FROM principals WHERE name = $1",
-                &[&old],
-            )?
+            let Some(row) =
+                txn.query_opt(self.sql.rename_select, &[&old])?
             else {
                 txn.rollback()?;
                 return Ok(Err(KdbError::NoEntry));
@@ -697,10 +804,9 @@ impl Store {
                     return Ok(Err(e));
                 }
             };
-            txn.execute("DELETE FROM principals WHERE name = $1", &[&old])?;
+            txn.execute(self.sql.rename_delete, &[&old])?;
             match txn.execute(
-                "INSERT INTO principals (name, entry, updated_at) \
-                 VALUES ($1, $2, now())",
+                self.sql.rename_insert,
                 &[&new, &new_blob],
             ) {
                 Ok(_) => {}
@@ -739,8 +845,9 @@ impl Store {
             return Err(KdbError::Custom(libc::EIO));
         }
         let sql = format!(
-            "SELECT name, entry FROM principals AS OF SYSTEM TIME '{ts}' \
-             WHERE name > $1 ORDER BY name LIMIT 512"
+            "SELECT name, entry FROM {} AS OF SYSTEM TIME '{ts}' \
+             WHERE name > $1 ORDER BY name LIMIT 512",
+            self.sql.principals_table
         );
         let mut last = String::new();
         loop {
@@ -767,19 +874,16 @@ impl Store {
 
     pub fn get_policy(&self, name: &str) -> Result<Option<Vec<u8>>, KdbError> {
         self.with_retry(|c| {
-            let stmt =
-                c.stmt("SELECT entry FROM policies WHERE name = $1")?;
+            let stmt = c.stmt(self.sql.get_policy)?;
             let row = c.client.query_opt(&stmt, &[&name])?;
             Ok(row.map(|r| r.get::<_, Vec<u8>>(0)))
         })
     }
 
     pub fn put_policy(&self, name: &str, blob: &[u8]) -> Result<(), KdbError> {
+        self.ensure_writes_allowed()?;
         self.with_retry(|c| {
-            let stmt = c.stmt(
-                "UPSERT INTO policies (name, entry, updated_at) \
-                 VALUES ($1, $2, now())",
-            )?;
+            let stmt = c.stmt(self.sql.put_policy)?;
             c.client.execute(&stmt, &[&name, &blob])?;
             Ok(())
         })
@@ -791,10 +895,9 @@ impl Store {
         name: &str,
         blob: &[u8],
     ) -> Result<(), KdbError> {
+        self.ensure_writes_allowed()?;
         self.with_retry(|c| {
-            let stmt = c.stmt(
-                "INSERT INTO policies (name, entry) VALUES ($1, $2)",
-            )?;
+            let stmt = c.stmt(self.sql.create_policy)?;
             match c.client.execute(&stmt, &[&name, &blob]) {
                 Ok(_) => Ok(Ok(())),
                 Err(e)
@@ -808,8 +911,9 @@ impl Store {
     }
 
     pub fn delete_policy(&self, name: &str) -> Result<(), KdbError> {
+        self.ensure_writes_allowed()?;
         let n = self.with_retry(|c| {
-            let stmt = c.stmt("DELETE FROM policies WHERE name = $1")?;
+            let stmt = c.stmt(self.sql.delete_policy)?;
             c.client.execute(&stmt, &[&name])
         })?;
         if n == 0 { Err(KdbError::NoEntry) } else { Ok(()) }
@@ -821,7 +925,7 @@ impl Store {
     ) -> Result<(), KdbError> {
         let rows: Vec<Vec<u8>> = self.with_retry(|c| {
             Ok(c.client
-                .query("SELECT entry FROM policies ORDER BY name", &[])?
+                .query(self.sql.iterate_policies, &[])?
                 .into_iter()
                 .map(|r| r.get::<_, Vec<u8>>(0))
                 .collect())
@@ -830,6 +934,266 @@ impl Store {
             cb(blob)?;
         }
         Ok(())
+    }
+
+    // -- kprop/iprop replica mode --------------------------------------------
+    //
+    // See schema.sql's prop_control block and README "Running as a
+    // kprop/iprop replica". lib.rs verifies the config knob; everything
+    // here is the database side of the gates: the operator marker, the
+    // single-receiver lease, the replica write-freeze, and the staged
+    // promote. The krb5prop SQL identity is enforced by grants, not code —
+    // a handle connected as krb5kdc simply cannot write staging tables.
+
+    /// Mark this handle as the verified receiver (freeze-exempt). Called
+    /// by lib.rs after the prop_control marker has been checked — the
+    /// store must exist before the marker can be read.
+    pub fn set_receiver(&self) {
+        self.receiver.store(true, Ordering::Relaxed);
+    }
+
+    /// The replica write-freeze. While the operator marker is enabled,
+    /// live-table writes are refused for everyone but the receiver: a
+    /// replica realm is read-only outside the propagation stream, and a
+    /// local write would be silently destroyed by the next full resync.
+    /// A missing prop_control table (pre-replica schema) means no freeze.
+    fn ensure_writes_allowed(&self) -> Result<(), KdbError> {
+        if self.staging || self.receiver.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let frozen = self.with_retry(|c| {
+            match c.client.query_opt(
+                "SELECT enabled FROM prop_control",
+                &[],
+            ) {
+                Ok(row) => Ok(row.is_some_and(|r| r.get::<_, bool>(0))),
+                Err(e)
+                    if e.code().map(|c| c.code()) == Some("42P01") =>
+                {
+                    Ok(false)
+                }
+                Err(e) => Err(e),
+            }
+        })?;
+        if frozen {
+            warn(
+                "write refused: this cluster is marked as a kprop/iprop \
+                 replica (prop_control.enabled) — writes may only arrive \
+                 through the propagation stream. To promote it to a \
+                 primary: UPDATE prop_control SET enabled = false",
+            );
+            return Err(KdbError::Custom(libc::EPERM));
+        }
+        Ok(())
+    }
+
+    /// The operator opt-in marker: Some((enabled, mode)) if the
+    /// prop_control row exists, None if the row or table is absent.
+    pub fn prop_marker(&self) -> Result<Option<(bool, String)>, KdbError> {
+        self.with_retry(|c| {
+            match c.client.query_opt(
+                "SELECT enabled, mode FROM prop_control",
+                &[],
+            ) {
+                Ok(row) => Ok(row.map(|r| (r.get(0), r.get(1)))),
+                Err(e)
+                    if e.code().map(|c| c.code()) == Some("42P01") =>
+                {
+                    Ok(None)
+                }
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    /// Take (or re-take/steal-if-expired) the single-receiver lease.
+    /// One statement, so two racing kpropds cannot both win.
+    pub fn take_prop_lease(&self) -> Result<(), KdbError> {
+        let holder = lease_holder_id();
+        let took = self.with_retry(|c| {
+            c.client.execute(
+                &format!(
+                    "UPDATE prop_control SET lease_holder = $1, \
+                     lease_expires = now() + interval '{LEASE_TTL}' \
+                     WHERE enabled AND (lease_holder IS NULL \
+                     OR lease_expires < now() OR lease_holder = $1)"
+                ),
+                &[&holder],
+            )
+        })?;
+        if took == 0 {
+            warn(
+                "receiver lease refused — another kpropd/load holds it \
+                 (or replica mode was just disabled)",
+            );
+            return Err(KdbError::Custom(libc::EBUSY));
+        }
+        Ok(())
+    }
+
+    fn extend_prop_lease(&self) -> Result<(), KdbError> {
+        let holder = lease_holder_id();
+        let n = self.with_retry(|c| {
+            c.client.execute(
+                &format!(
+                    "UPDATE prop_control SET lease_expires = now() + \
+                     interval '{LEASE_TTL}' WHERE lease_holder = $1 \
+                     AND enabled"
+                ),
+                &[&holder],
+            )
+        })?;
+        if n == 0 {
+            // Lost the lease (stolen after expiry, or marker disabled)
+            // mid-load: stop streaming immediately rather than fight the
+            // new holder.
+            warn("receiver lease lost mid-load; aborting");
+            return Err(KdbError::Custom(libc::EBUSY));
+        }
+        Ok(())
+    }
+
+    /// Empty the staging tables (paged DML — the plugin never issues DDL,
+    /// so no TRUNCATE). Runs at open(temporary) so every load starts from
+    /// a clean slate even after an aborted predecessor.
+    pub fn clear_staging(&self) -> Result<(), KdbError> {
+        for table in ["principals_staging", "policies_staging"] {
+            let sql = format!(
+                "DELETE FROM {table} WHERE true LIMIT {PROMOTE_BATCH}"
+            );
+            loop {
+                let n = self.with_retry(|c| c.client.execute(&sql, &[]))?;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The staged swap: diff-sync staging into the live tables. Batched,
+    /// upserts before deletes — a KDC mid-promote can see the old or the
+    /// new version of an entry but never a hole. Deliberately NOT one
+    /// atomic flip: at realm scale that is a several-hundred-MB intent
+    /// set, and the bounded old-or-new window is exactly what iprop
+    /// incremental replay produces anyway. Unchanged rows are skipped, so
+    /// a routine re-prop pays the GLOBAL commit-wait only for the delta.
+    pub fn promote_staging(&self) -> Result<(), KdbError> {
+        let holder = lease_holder_id();
+        let held = self.with_retry(|c| {
+            let row = c.client.query_opt(
+                "SELECT 1 FROM prop_control WHERE enabled \
+                 AND lease_holder = $1 AND lease_expires > now()",
+                &[&holder],
+            )?;
+            Ok(row.is_some())
+        })?;
+        if !held {
+            warn(
+                "promote refused: receiver lease not held (was the load \
+                 interrupted, or replica mode disabled mid-load?)",
+            );
+            return Err(KdbError::Custom(libc::EPERM));
+        }
+        // A dump always contains at least K/M and krbtgt. Empty staging
+        // means promote_db was reached without a load — promoting it
+        // would delete the whole realm.
+        let staged: i64 = self.with_retry(|c| {
+            Ok(c.client
+                .query_one("SELECT count(*) FROM principals_staging", &[])?
+                .get(0))
+        })?;
+        if staged == 0 {
+            warn("promote refused: staging is empty");
+            return Err(KdbError::Custom(libc::EINVAL));
+        }
+        self.extend_prop_lease()?;
+
+        let up_p = self.promote_upserts("principals", "principals_staging")?;
+        let up_o = self.promote_upserts("policies", "policies_staging")?;
+        let del_p = self.promote_deletes("principals", "principals_staging")?;
+        let del_o = self.promote_deletes("policies", "policies_staging")?;
+        warn(&format!(
+            "promote complete: {staged} staged principals; \
+             {up_p}+{up_o} upserted, {del_p}+{del_o} deleted \
+             (principals+policies; unchanged rows untouched)"
+        ));
+
+        self.clear_staging()?;
+        self.with_retry(|c| {
+            c.client.execute(
+                "UPDATE prop_control SET lease_holder = NULL, \
+                 lease_expires = NULL, last_promote_at = now() \
+                 WHERE lease_holder = $1",
+                &[&holder],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Upsert pass: staging rows that are new or differ from live. The
+    /// cursor advances over SCANNED staging names (not upserted ones) so
+    /// a long run of unchanged rows cannot stall it.
+    fn promote_upserts(
+        &self,
+        live: &str,
+        staging: &str,
+    ) -> Result<u64, KdbError> {
+        let scan = format!(
+            "SELECT name FROM {staging} WHERE name > $1 \
+             ORDER BY name LIMIT {PROMOTE_BATCH}"
+        );
+        let upsert = format!(
+            "UPSERT INTO {live} (name, entry, updated_at) \
+             SELECT s.name, s.entry, now() FROM {staging} s \
+             LEFT JOIN {live} p ON p.name = s.name \
+             WHERE s.name > $1 AND s.name <= $2 \
+             AND (p.name IS NULL OR p.entry <> s.entry)"
+        );
+        let mut cursor = String::new();
+        let mut total = 0u64;
+        loop {
+            let hi: Option<String> = self.with_retry(|c| {
+                let rows = c.client.query(scan.as_str(), &[&cursor])?;
+                Ok(rows.last().map(|r| r.get(0)))
+            })?;
+            let Some(hi) = hi else { return Ok(total) };
+            total += self.with_retry(|c| {
+                c.client.execute(upsert.as_str(), &[&cursor, &hi])
+            })?;
+            cursor = hi;
+        }
+    }
+
+    /// Delete pass, after all upserts: live rows absent from staging.
+    fn promote_deletes(
+        &self,
+        live: &str,
+        staging: &str,
+    ) -> Result<u64, KdbError> {
+        let scan = format!(
+            "SELECT name FROM {live} WHERE name > $1 \
+             ORDER BY name LIMIT {PROMOTE_BATCH}"
+        );
+        let delete = format!(
+            "DELETE FROM {live} WHERE name > $1 AND name <= $2 \
+             AND name NOT IN \
+             (SELECT name FROM {staging} \
+              WHERE name > $1 AND name <= $2)"
+        );
+        let mut cursor = String::new();
+        let mut total = 0u64;
+        loop {
+            let hi: Option<String> = self.with_retry(|c| {
+                let rows = c.client.query(scan.as_str(), &[&cursor])?;
+                Ok(rows.last().map(|r| r.get(0)))
+            })?;
+            let Some(hi) = hi else { return Ok(total) };
+            total += self.with_retry(|c| {
+                c.client.execute(delete.as_str(), &[&cursor, &hi])
+            })?;
+            cursor = hi;
+        }
     }
 }
 
@@ -1374,6 +1738,345 @@ mod tests {
         }
         let _ = store.delete_principal(&moved_from);
         let _ = store.delete_principal(&moved_to);
+    }
+
+    // -- kprop/iprop replica mode -------------------------------------------
+    //
+    // These manipulate global state (the prop_control marker, the write
+    // freeze), so they run in their own database (krb5proptest, created
+    // idempotently here) and serialize among themselves — the regular
+    // tests above keep running in parallel against krb5 untouched.
+
+    static PROP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn certs_dir() -> String {
+        format!("{}/e2e/.certs", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// Raw root client for test setup/asserts (Store exposes no raw SQL,
+    /// on purpose).
+    fn root_client() -> Client {
+        let pem = std::fs::read(format!("{}/ca.crt", certs_dir())).unwrap();
+        let connector = TlsConnector::builder()
+            .add_root_certificate(Certificate::from_pem(&pem).unwrap())
+            .build()
+            .unwrap();
+        Client::connect(
+            "postgresql://root:root-dev-pw@localhost:26257/krb5proptest\
+             ?sslmode=require",
+            MakeTlsConnector::new(connector),
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "cannot connect as root ({e}) — is the compose cluster up?"
+            )
+        })
+    }
+
+    fn prop_test_env() -> Client {
+        let pem = std::fs::read(format!("{}/ca.crt", certs_dir())).unwrap();
+        let connector = TlsConnector::builder()
+            .add_root_certificate(Certificate::from_pem(&pem).unwrap())
+            .build()
+            .unwrap();
+        let mut boot = Client::connect(
+            "postgresql://root:root-dev-pw@localhost:26257?sslmode=require",
+            MakeTlsConnector::new(connector),
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "cannot connect as root ({e}) — is the compose cluster up?"
+            )
+        });
+        boot.batch_execute(
+            "CREATE DATABASE IF NOT EXISTS krb5proptest;
+             CREATE TABLE IF NOT EXISTS krb5proptest.principals (
+                 name STRING NOT NULL PRIMARY KEY, entry BYTES NOT NULL,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+             CREATE TABLE IF NOT EXISTS krb5proptest.policies (
+                 name STRING NOT NULL PRIMARY KEY, entry BYTES NOT NULL,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+             CREATE TABLE IF NOT EXISTS krb5proptest.aliases (
+                 alias STRING NOT NULL PRIMARY KEY, canonical STRING NOT NULL,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+             CREATE TABLE IF NOT EXISTS krb5proptest.principals_staging (
+                 name STRING NOT NULL PRIMARY KEY, entry BYTES NOT NULL,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+             CREATE TABLE IF NOT EXISTS krb5proptest.policies_staging (
+                 name STRING NOT NULL PRIMARY KEY, entry BYTES NOT NULL,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+             CREATE TABLE IF NOT EXISTS krb5proptest.prop_control (
+                 singleton BOOL NOT NULL PRIMARY KEY DEFAULT true
+                     CHECK (singleton),
+                 enabled BOOL NOT NULL,
+                 mode STRING NOT NULL CHECK (mode IN ('kprop','iprop')),
+                 lease_holder STRING, lease_expires TIMESTAMPTZ,
+                 last_promote_at TIMESTAMPTZ);
+             GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
+                 krb5proptest.principals, krb5proptest.policies
+                 TO krb5kdc;
+             GRANT SELECT ON TABLE krb5proptest.aliases,
+                 krb5proptest.prop_control TO krb5kdc;
+             GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
+                 krb5proptest.principals, krb5proptest.policies,
+                 krb5proptest.principals_staging,
+                 krb5proptest.policies_staging TO krb5prop;
+             GRANT SELECT, UPDATE ON TABLE krb5proptest.prop_control
+                 TO krb5prop;",
+        )
+        .unwrap();
+        let mut c = root_client();
+        // Clean slate: marker absent, tables empty.
+        c.batch_execute(
+            "DELETE FROM prop_control WHERE true;
+             DELETE FROM principals WHERE true;
+             DELETE FROM policies WHERE true;
+             DELETE FROM principals_staging WHERE true;
+             DELETE FROM policies_staging WHERE true;",
+        )
+        .unwrap();
+        c
+    }
+
+    fn prop_uri(user: &str, pw: &str) -> String {
+        format!(
+            "postgresql://{user}:{pw}@localhost:26257/krb5proptest\
+             ?sslmode=verify-full&sslrootcert={}/ca.crt",
+            certs_dir()
+        )
+    }
+
+    fn kdc_user_store() -> Store {
+        Store::connect(&prop_uri("krb5kdc", "krb5kdc-dev-pw")).unwrap()
+    }
+
+    fn receiver_store(staging: bool) -> Store {
+        Store::connect_opts(
+            &prop_uri("krb5prop", "krb5prop-dev-pw"),
+            StoreOpts {
+                staging,
+                receiver: !staging,
+                ..StoreOpts::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn enable_marker(c: &mut Client, mode: &str) {
+        c.execute(
+            "UPSERT INTO prop_control (singleton, enabled, mode) \
+             VALUES (true, true, $1)",
+            &[&mode],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn staging_load_is_isolated_then_promote_diff_syncs() {
+        let _g = PROP_TEST_LOCK.lock().unwrap();
+        let mut root = prop_test_env();
+
+        // Live baseline, written BEFORE the marker enables the freeze:
+        // A will change, B is identical in the dump, C is absent from it.
+        let kdc = kdc_user_store();
+        for (n, b) in
+            [("A@R", "old-a"), ("B@R", "same-b"), ("C@R", "gone-c")]
+        {
+            kdc.put_principal(n, b.as_bytes()).unwrap();
+        }
+        kdc.put_policy("polB@R", b"same").unwrap();
+        kdc.put_policy("polC@R", b"gone").unwrap();
+
+        enable_marker(&mut root, "iprop");
+
+        // The "kdb5_util load": mirrors open_staging (lease, clear, puts).
+        let stage = receiver_store(true);
+        stage.take_prop_lease().unwrap();
+        stage.clear_staging().unwrap();
+        for (n, b) in
+            [("A@R", "new-a"), ("B@R", "same-b"), ("D@R", "new-d")]
+        {
+            stage.put_principal(n, b.as_bytes()).unwrap();
+        }
+        stage.put_policy("polB@R", b"same").unwrap();
+        stage.put_policy("polD@R", b"new").unwrap();
+
+        // Mid-load: the live tables must be byte-identical to baseline.
+        assert_eq!(
+            kdc.get_principal("A@R").unwrap().unwrap(),
+            b"old-a".to_vec(),
+            "staged load leaked into the live tables"
+        );
+        assert!(kdc.get_principal("D@R").unwrap().is_none());
+        // And the staging handle reads its own writes, not live data.
+        assert_eq!(
+            stage.get_principal("A@R").unwrap().unwrap(),
+            b"new-a".to_vec()
+        );
+
+        // promote_db: fresh receiver handle, same process (same lease id).
+        let live = receiver_store(false);
+        live.promote_staging().unwrap();
+
+        assert_eq!(kdc.get_principal("A@R").unwrap().unwrap(), b"new-a");
+        assert_eq!(kdc.get_principal("B@R").unwrap().unwrap(), b"same-b");
+        assert!(
+            kdc.get_principal("C@R").unwrap().is_none(),
+            "principal absent from the dump survived the promote"
+        );
+        assert_eq!(kdc.get_principal("D@R").unwrap().unwrap(), b"new-d");
+        assert_eq!(kdc.get_policy("polB@R").unwrap().unwrap(), b"same");
+        assert!(kdc.get_policy("polC@R").unwrap().is_none());
+        assert_eq!(kdc.get_policy("polD@R").unwrap().unwrap(), b"new");
+
+        // Promote released the lease, stamped the marker, cleared staging.
+        let row = root
+            .query_one(
+                "SELECT lease_holder IS NULL, last_promote_at IS NOT NULL, \
+                 (SELECT count(*) FROM principals_staging) \
+                 FROM prop_control",
+                &[],
+            )
+            .unwrap();
+        assert!(row.get::<_, bool>(0), "lease not released");
+        assert!(row.get::<_, bool>(1), "last_promote_at not stamped");
+        assert_eq!(row.get::<_, i64>(2), 0, "staging not cleared");
+
+        root.execute("DELETE FROM prop_control WHERE true", &[]).unwrap();
+    }
+
+    #[test]
+    fn write_freeze_blocks_everyone_but_the_receiver() {
+        let _g = PROP_TEST_LOCK.lock().unwrap();
+        let mut root = prop_test_env();
+        let kdc = kdc_user_store();
+        kdc.put_principal("frozen@R", b"v1").unwrap();
+
+        enable_marker(&mut root, "kprop");
+        // Non-receiver writes: all refused with EPERM…
+        let eperm = |e: &KdbError| {
+            matches!(e, KdbError::Custom(c) if *c == libc::EPERM)
+        };
+        assert!(eperm(&kdc.put_principal("frozen@R", b"v2").unwrap_err()));
+        assert!(eperm(&kdc.delete_principal("frozen@R").unwrap_err()));
+        assert!(eperm(&kdc.put_policy("p@R", b"x").unwrap_err()));
+        assert!(eperm(&kdc.create_policy("p@R", b"x").unwrap_err()));
+        assert!(eperm(
+            &kdc.rename_principal("frozen@R", "thawed@R", |b| Ok(b.to_vec()))
+                .unwrap_err()
+        ));
+        // …reads still work…
+        assert_eq!(kdc.get_principal("frozen@R").unwrap().unwrap(), b"v1");
+        // …and the receiver handle (the propagation stream) writes fine.
+        let recv = receiver_store(false);
+        recv.put_principal("frozen@R", b"v2-from-primary").unwrap();
+        assert_eq!(
+            kdc.get_principal("frozen@R").unwrap().unwrap(),
+            b"v2-from-primary"
+        );
+
+        // Operator promote-to-primary: freeze lifts.
+        root.execute(
+            "UPDATE prop_control SET enabled = false WHERE true",
+            &[],
+        )
+        .unwrap();
+        kdc.put_principal("frozen@R", b"v3").unwrap();
+        assert_eq!(kdc.get_principal("frozen@R").unwrap().unwrap(), b"v3");
+
+        kdc.delete_principal("frozen@R").unwrap();
+        root.execute("DELETE FROM prop_control WHERE true", &[]).unwrap();
+    }
+
+    #[test]
+    fn lease_contention_and_expiry() {
+        let _g = PROP_TEST_LOCK.lock().unwrap();
+        let mut root = prop_test_env();
+        enable_marker(&mut root, "iprop");
+        let stage = receiver_store(true);
+
+        // A live foreign lease refuses us…
+        root.execute(
+            "UPDATE prop_control SET lease_holder = 'other-kpropd', \
+             lease_expires = now() + interval '1 hour' WHERE true",
+            &[],
+        )
+        .unwrap();
+        let err = stage.take_prop_lease().unwrap_err();
+        assert!(
+            matches!(err, KdbError::Custom(c) if c == libc::EBUSY),
+            "foreign lease must refuse with EBUSY, got {err:?}"
+        );
+        // …an expired one is stolen…
+        root.execute(
+            "UPDATE prop_control SET lease_expires = now() - \
+             interval '1 second' WHERE true",
+            &[],
+        )
+        .unwrap();
+        stage.take_prop_lease().unwrap();
+        // …and re-taking our own lease is idempotent.
+        stage.take_prop_lease().unwrap();
+
+        // With the marker disabled the lease is unavailable entirely.
+        root.execute(
+            "UPDATE prop_control SET enabled = false WHERE true",
+            &[],
+        )
+        .unwrap();
+        assert!(stage.take_prop_lease().is_err());
+        root.execute("DELETE FROM prop_control WHERE true", &[]).unwrap();
+    }
+
+    #[test]
+    fn promote_refuses_without_lease_or_with_empty_staging() {
+        let _g = PROP_TEST_LOCK.lock().unwrap();
+        let mut root = prop_test_env();
+        enable_marker(&mut root, "iprop");
+        let live = receiver_store(false);
+
+        // No lease taken → EPERM, live tables untouched.
+        let err = live.promote_staging().unwrap_err();
+        assert!(matches!(err, KdbError::Custom(c) if c == libc::EPERM));
+
+        // Lease held but staging empty → EINVAL: promoting an empty
+        // staging set would delete the whole realm.
+        let stage = receiver_store(true);
+        stage.take_prop_lease().unwrap();
+        let kdc_probe = receiver_store(false);
+        kdc_probe.put_principal("survivor@R", b"x").unwrap();
+        let err = live.promote_staging().unwrap_err();
+        assert!(
+            matches!(err, KdbError::Custom(c) if c == libc::EINVAL),
+            "empty-staging promote must refuse, got {err:?}"
+        );
+        assert!(
+            kdc_probe.get_principal("survivor@R").unwrap().is_some(),
+            "refused promote must not touch live rows"
+        );
+        root.execute("DELETE FROM prop_control WHERE true", &[]).unwrap();
+    }
+
+    #[test]
+    fn staging_writes_need_the_krb5prop_identity() {
+        let _g = PROP_TEST_LOCK.lock().unwrap();
+        let mut root = prop_test_env();
+        enable_marker(&mut root, "iprop");
+        // Gate 3 is SQL grants: a staging handle connected as krb5kdc
+        // cannot write the staging tables no matter what the config says.
+        let imposter = Store::connect_opts(
+            &prop_uri("krb5kdc", "krb5kdc-dev-pw"),
+            StoreOpts { staging: true, ..StoreOpts::default() },
+        )
+        .unwrap();
+        assert!(
+            imposter.put_principal("evil@R", b"x").is_err(),
+            "krb5kdc identity must not be able to stage a load"
+        );
+        // And it cannot take the lease either (prop_control UPDATE is
+        // krb5prop/root only).
+        assert!(imposter.take_prop_lease().is_err());
+        root.execute("DELETE FROM prop_control WHERE true", &[]).unwrap();
     }
 
     #[test]

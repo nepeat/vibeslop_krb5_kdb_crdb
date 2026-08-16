@@ -149,6 +149,42 @@ fn conf_ms(
     })
 }
 
+/// `prop_receiver`: opt-in knob for kprop/iprop replica mode (config gate
+/// 1 of 3 — see the [dbmodules] docs and schema.sql's prop_control block).
+/// Off by default; `iprop` also covers plain kprop loads (an iprop full
+/// resync IS one).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PropMode {
+    Off,
+    Kprop,
+    Iprop,
+}
+
+fn prop_mode(
+    ctx: &KdbContext<'_>,
+    section: &str,
+    db_args: &[&str],
+) -> Result<PropMode, KdbError> {
+    match conf(ctx, section, db_args, "prop_receiver").as_deref() {
+        None | Some("off") => Ok(PropMode::Off),
+        Some("kprop") => Ok(PropMode::Kprop),
+        Some("iprop") => Ok(PropMode::Iprop),
+        Some(other) => {
+            warn(&format!(
+                "prop_receiver={other} is not one of off|kprop|iprop"
+            ));
+            Err(KdbError::Custom(libc::EINVAL))
+        }
+    }
+}
+
+fn has_db_arg(db_args: &[&str], arg: &str) -> bool {
+    let prefixed = format!("{arg}=");
+    db_args
+        .iter()
+        .any(|a| *a == arg || a.starts_with(&prefixed))
+}
+
 impl CrdbKdb {
     fn canonical_name(
         &self,
@@ -158,6 +194,53 @@ impl CrdbKdb {
         // Full unparse (with realm) so one cluster can serve several realms
         // out of a single principals table if you ever want that.
         ctx.unparse_principal(princ)
+    }
+
+    /// A gated `kdb5_util load`: verify the remaining replica-mode gates
+    /// (the operator marker; the krb5prop identity is enforced by SQL
+    /// grants the moment we touch staging), take the single-receiver
+    /// lease, and hand back a handle whose every statement goes to the
+    /// staging tables. `load -i` additionally passes `merge_nra` ("merge
+    /// non-replicated attributes") — this backend stores none (lockout/
+    /// last-auth are off by design), so it needs no handling beyond
+    /// requiring iprop mode; the full-replace promote is already correct.
+    fn open_staging(
+        uri: &str,
+        db_args: &[&str],
+        pmode: PropMode,
+    ) -> Result<Self, KdbError> {
+        let store = Store::connect_opts(
+            uri,
+            StoreOpts { staging: true, ..StoreOpts::default() },
+        )?;
+        let Some((enabled, marker_mode)) = store.prop_marker()? else {
+            warn(
+                "load refused: no prop_control marker row — replica mode \
+                 needs the operator opt-in (see schema.sql)",
+            );
+            return Err(KdbError::Custom(libc::EPERM));
+        };
+        if !enabled {
+            warn("load refused: prop_control.enabled is false");
+            return Err(KdbError::Custom(libc::EPERM));
+        }
+        // An iprop full resync (`load -i`, merge_nra present) needs BOTH
+        // the knob and the marker to say iprop; a plain kprop dump is
+        // fine under either mode.
+        if has_db_arg(db_args, "merge_nra")
+            && (pmode != PropMode::Iprop || marker_mode != "iprop")
+        {
+            warn(
+                "iprop load refused: needs prop_receiver=iprop AND \
+                 prop_control.mode='iprop'",
+            );
+            return Err(KdbError::Custom(libc::EPERM));
+        }
+        store.take_prop_lease()?;
+        // Clean slate even after an aborted predecessor load.
+        store.clear_staging()?;
+        warn("replica load: streaming into staging tables");
+        Ok(CrdbKdb { store, cache: None })
     }
 }
 
@@ -169,15 +252,18 @@ impl KdbModule for CrdbKdb {
         mode: OpenMode,
     ) -> Result<Self, KdbError> {
         // kdb5_util load (without -update) opens a "temporary" database,
-        // streams the dump into it, then atomically swaps it live via
-        // promote_db. There is no side database here: accepting the arg
-        // would write the dump straight into the live GLOBAL tables and
-        // only fail at the end. Fail fast instead; restore with
-        // `kdb5_util load -update` or CRDB-native BACKUP/RESTORE.
-        if db_args
-            .iter()
-            .any(|a| *a == "temporary" || a.starts_with("temporary="))
-        {
+        // streams the dump into it, then swaps it live via promote_db.
+        // Without the replica-mode opt-in there is no side database here:
+        // accepting the arg would write the dump straight into the live
+        // GLOBAL tables and only fail at the end. Fail fast instead;
+        // restore with `kdb5_util load -update` or CRDB-native
+        // BACKUP/RESTORE. With `prop_receiver` set (and the other two
+        // gates below passing), the load is routed into the staging
+        // tables instead — that is how the cluster receives a kprop
+        // dump from an external primary.
+        let temporary = has_db_arg(db_args, "temporary");
+        let pmode = prop_mode(ctx, conf_section, db_args)?;
+        if temporary && pmode == PropMode::Off {
             return Err(KdbError::Custom(libc::EINVAL));
         }
 
@@ -189,6 +275,10 @@ impl KdbModule for CrdbKdb {
             .or_else(|| ctx.db_module_string(conf_section, "connection_uri"))
             .or_else(|| std::env::var("KDB_CRDB_URI").ok())
             .ok_or(KdbError::Custom(libc::EINVAL))?;
+
+        if temporary {
+            return Self::open_staging(&uri, db_args, pmode);
+        }
 
         let is_kdc = matches!(mode.server, ServerType::Kdc);
 
@@ -244,13 +334,29 @@ impl KdbModule for CrdbKdb {
             }),
         };
 
-        Ok(CrdbKdb {
-            store: Store::connect_opts(
-                &uri,
-                StoreOpts { stale_ms, startup_retry_ms, offline },
-            )?,
-            cache,
-        })
+        let store = Store::connect_opts(
+            &uri,
+            StoreOpts {
+                stale_ms,
+                startup_retry_ms,
+                offline,
+                ..StoreOpts::default()
+            },
+        )?;
+
+        // Receiver hosts (prop_receiver set, admin-side roles): if the
+        // operator marker is on, this handle is the propagation stream —
+        // exempt from the replica write-freeze so kpropd's iprop
+        // incremental applies land. KDC handles never write, and every
+        // handle WITHOUT the knob stays freeze-checked, so a stray
+        // kadmind elsewhere cannot exempt itself.
+        if pmode != PropMode::Off && !is_kdc {
+            if let Ok(Some((true, _))) = store.prop_marker() {
+                store.set_receiver();
+            }
+        }
+
+        Ok(CrdbKdb { store, cache })
     }
 
     // -- database lifecycle --------------------------------------------------
@@ -295,18 +401,35 @@ impl KdbModule for CrdbKdb {
         Ok(())
     }
 
-    // Unreachable in practice: promote_db only runs at the end of a plain
-    // `kdb5_util load`, whose "temporary" open is already rejected above.
-    // No-op so nothing ever unwinds or errors mid-swap if some other code
-    // path calls it.
+    // The end of a gated `kdb5_util load`: diff-sync the staged dump into
+    // the live tables. A static vtable call (no module instance), so it
+    // re-opens its own Store and re-verifies the gates — the lease taken
+    // at open(temporary) is re-derived from a process-global id (load
+    // runs create → puts → promote in one process; spike-verified).
+    // Without the opt-in it stays a no-op so nothing ever unwinds or
+    // errors mid-swap if some other code path calls it.
     const SUPPORTS_PROMOTE_DB: bool = true;
 
     fn promote_db(
-        _ctx: &KdbContext<'_>,
-        _conf_section: &str,
-        _db_args: &[&str],
+        ctx: &KdbContext<'_>,
+        conf_section: &str,
+        db_args: &[&str],
     ) -> Result<(), KdbError> {
-        Ok(())
+        let pmode = prop_mode(ctx, conf_section, db_args)?;
+        if pmode == PropMode::Off || !has_db_arg(db_args, "temporary") {
+            return Ok(());
+        }
+        let uri = db_args
+            .iter()
+            .find_map(|a| a.strip_prefix("dburl=").map(str::to_owned))
+            .or_else(|| ctx.db_module_string(conf_section, "connection_uri"))
+            .or_else(|| std::env::var("KDB_CRDB_URI").ok())
+            .ok_or(KdbError::Custom(libc::EINVAL))?;
+        let store = Store::connect_opts(
+            &uri,
+            StoreOpts { receiver: true, ..StoreOpts::default() },
+        )?;
+        store.promote_staging()
     }
 
     // -- principal CRUD ------------------------------------------------------
