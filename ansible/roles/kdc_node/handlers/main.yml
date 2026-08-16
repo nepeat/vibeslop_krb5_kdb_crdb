@@ -6,11 +6,15 @@
   ansible.builtin.systemd:
     daemon_reload: true
 
+# throttle: 1 keeps rollout restarts one-KDC-at-a-time even though the
+# install play runs fully parallel.
 - name: try-restart krb5kdc
   ansible.builtin.command: systemctl try-restart krb5kdc.service
   changed_when: true
+  throttle: 1
 
 - name: try-restart kadmind
   ansible.builtin.command: systemctl try-restart kadmind.service
   changed_when: true
   when: inventory_hostname == kdc_admin_host
+  throttle: 1

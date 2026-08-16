@@ -78,10 +78,12 @@
 
 # ---- Kerberos KDCs (containerized: nix-built image, podman quadlets) ----
 
+# Parallel on purpose: first-install has nothing running to disrupt, and
+# the restart handlers are throttle: 1, so image/config rollouts still
+# restart one KDC at a time.
 - name: KDC nodes (image, config, quadlet units)
   hosts: kdc
   become: true
-  serial: 1
   tags: [kdc]
   roles:
     - kdc_node
