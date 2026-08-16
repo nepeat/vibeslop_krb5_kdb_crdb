@@ -590,3 +590,20 @@ everywhere (deliberate — runbook path is `kdb5_util stash` with the
 banked master password); k8s/ still uses its own registry push flow
 (point it at `nix build .#kdc-image` + skopeo next time the sea1 rig is
 touched).
+
+## 2026-08-16: multi-arch images + registry push (justfile)
+
+- justfile added: `image-build [x86_64|aarch64]`, `image-load`,
+  `image-push`. Push target hub.generalprogramming.org/erinpublic/kdc
+  (Harbor; bare `/kdc` 400s — repos need a <project>/ prefix, and erin's
+  OIDC CLI secret has no push role on `library`, which also means the
+  Harbor API refuses it entirely — project changes are UI-only for us).
+  Pushes <shortrev>[-dirty]-{amd64,arm64} via skopeo then stitches
+  :<shortrev> and :latest manifest lists with manifest-tool.
+- aarch64 on this x86 box: qemu binfmt registered per boot via
+  `docker run --privileged --rm tonistiigi/binfmt --install arm64`
+  (flags POCF; the F matters for nix sandbox builds). erin is a nix
+  trusted user so `--extra-platforms aarch64-linux` works from the CLI;
+  the kdc_node ansible task now passes it too. Full aarch64 kdc-image
+  builds under emulation (~50 min, mostly rustc; both arches 29MB
+  compressed) and smoke-runs via docker --platform linux/arm64.

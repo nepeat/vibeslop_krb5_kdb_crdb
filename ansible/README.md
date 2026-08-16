@@ -66,8 +66,13 @@ proves every KDC issues tickets (kinit in the container).
 
 Re-running `site.yml --tags kdc` after a code change rebuilds the image
 via nix and serially restarts only the KDCs whose tarball changed.
-Cross-arch note: an x86 controller can't `nix build` for arm hosts
-without qemu binfmt — set `kdc_image_tar` to a prebuilt tarball instead.
+Cross-arch note: an x86 controller building for arm hosts needs qemu
+binfmt registered once per boot (`docker run --privileged --rm
+tonistiigi/binfmt --install arm64`; see the repo justfile) — or set
+`kdc_image_tar` to a prebuilt tarball. Registry-based delivery is also
+available via `just image-push` (hub.generalprogramming.org/library/kdc,
+multi-arch manifest), but the default flow ships tarballs over SSH and
+needs neither registry access on the hosts nor pull secrets.
 
 ## Not covered (yet)
 
