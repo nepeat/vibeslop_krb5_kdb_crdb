@@ -1,0 +1,539 @@
+# Progress log
+
+Running log for agent work on kdb-crdb. Append dated entries; don't rewrite
+history. See ../CLAUDE.md for project goals and conventions.
+
+## 2026-07-11
+
+- Repo bootstrapped: `lib.rs` (KdbModule impl), `marshal.rs` (postcard wire
+  codec), `store.rs` (postgres client + retry loop), `schema.sql`
+  (multi-region GLOBAL tables), `Cargo.toml`, `README.md`.
+- Added `CLAUDE.md` with project goals and conventions, and this log.
+- Not yet done: no test suite, TLS still stubbed as `NoTls`, no
+  docker-compose file for a local multi-region CRDB cluster.
+- Next step: stand up a docker-compose CRDB cluster for local dev/test,
+  then write an integration test that exercises get/put/delete/rename/
+  iterate against it.
+
+## 2026-07-11 (later): dev env + CRDB integration tests
+
+- Moved sources into `src/` (Cargo layout; they were sitting at repo root
+  and nothing compiled).
+- Added `flake.nix` dev shell (per user: **flakes, not shell.nix**), pinned
+  to nixpkgs-unstable via `flake.lock`. Needed because kurbu5 0.1.2 requires
+  krb5 >= 1.22.1 headers (`krb5_db_load_module` missing from 1.21's kdb.h —
+  stable nixpkgs' 1.21.3 fails the build). Shell provides openssl,
+  krb5 1.22.2, libclang + `BINDGEN_EXTRA_CLANG_ARGS` (bindgen doesn't see
+  the cc-wrapper's include paths). `nix develop --command cargo build`
+  builds the cdylib clean.
+- Added `docker-compose.yml`: 3-node CRDB (cockroachdb/cockroach:latest-v25.2)
+  with `--locality=region={us-west2,us-east1,europe-west4}` matching
+  schema.sql, plus a one-shot `roach-init` that runs `cockroach init` and
+  applies `schema.sql`. Multi-region DDL (PRIMARY REGION, LOCALITY GLOBAL)
+  applies without license trouble on v25.2. SQL on localhost:26257/26258/26259
+  (west/east/eu), admin UI on 8081 (8080 was taken on this box).
+- Test suite (first one): `cargo test` runs unit tests in `marshal.rs`
+  (postcard wire round-trip incl. key data, version rejection) and
+  integration tests in `store.rs` against the compose cluster
+  (`KDB_CRDB_TEST_URI` overrides the default localhost:26257 insecure URI).
+  Covers: **key-data put/get round-trip (the keytab material — bit-for-bit)**,
+  key-rotation upsert, get-missing → None, delete-missing → NoEntry, rename
+  (blob name rewrite + atomic swap + NoEntry case), keyset-paginated
+  iteration, policy create-only/put/get/delete. 10/10 pass; store suite also
+  passes pointed at the us-east1 node (26258), i.e. writes are readable from
+  every region as designed.
+- Derived `Debug/Clone/PartialEq/Eq` on `WireKey`/`WireEntry` for the tests.
+- Still open: TLS still `NoTls`; no real krb5kdc/kadmind in compose yet
+  (that's the "functional" bar); marshal `decode_entry`/`encode_entry`
+  (KdbContext paths) untested — needs a real krb5 context, which points at
+  the same next step.
+- Next concrete step: add krb5kdc + kadmind containers (nix or distro pkgs
+  + the built kdb_crdb.so) to docker-compose and script `kdb5_util create`,
+  `kadmin.local addprinc/ktadd`, `kinit` smoke test end-to-end.
+
+## 2026-07-11 (later still): end-to-end kadmin/ktadd/kinit PASSES
+
+- `e2e/run.sh` (+ `krb5.conf.in`/`kdc.conf.in` templates): runs a real
+  krb5kdc + kadmind from the pinned nix krb5 1.22.2 (same libkdb5 the
+  plugin links) directly on this box against the compose CRDB cluster —
+  no KDC container needed after all. Unprivileged ports (KDC 10088,
+  kadmind 10749). DESTRUCTIVE: truncates principals/policies first.
+  Flow: cargo build → kdb5_util create -s → start daemons →
+  network kadmin addprinc alice + addprinc -randkey host/… + ktadd →
+  kinit alice (AS-REQ) → kvno host/… (TGS-REQ) → kinit -kt keytab.
+  **All steps pass.** The full get/put path through KdbContext
+  (marshal encode/decode_entry) is now exercised by real krb5 daemons.
+- Two fixes needed to get there:
+  1. libkdb5 ignores `plugin_base_dir` for KDB modules — it loads from
+     `db_module_dir` in `[dbmodules]` (kdc.conf). Set in the template.
+  2. `kdb5_util create` calls the `create` vtable slot; a NULL slot is
+     KRB5_PLUGIN_OP_NOTSUPP and bootstrap dies (README's old claim that
+     create "initializes via open + puts" was wrong). Implemented
+     `SUPPORTS_CREATE = true` + `create()` = open + `ctx.set_module()`
+     (the klmdb contract per kurbu5 docs) in lib.rs.
+- `cargo test` still 10/10 after the change.
+- Still open: TLS (`NoTls`), alias/referral LookupFlags, policy tl_data,
+  `has_salt` inference — see CLAUDE.md gaps.
+- Next concrete step: TLS (postgres-native-tls + verify-full, secure-mode
+  compose with certs), then start looking at read QPS on get_principal
+  (e.g. prepared statement caching) per the project goal ordering.
+
+## 2026-07-11 (afternoon): rename bug, load/destroy semantics, stress + backend validation
+
+- **Real bug found & fixed** in `store::rename_principal`: it ran
+  UPSERT-new *then* DELETE-old in one txn and only checked the delete
+  count after commit — renaming a *nonexistent* principal committed a
+  phantom target row (with a mismatched embedded blob name, which then
+  resurfaced under a *third* name via dump → load -update). Discovered
+  via stray `kt-rename-*` rows in a dump/load experiment. Fix: DELETE
+  first, roll back and return NoEntry when it matches nothing. Regression
+  assert added to `principal_rename_swaps_atomically`.
+- `kdb5_util load` (plain) footgun guarded: `open()` now rejects the
+  `temporary` db_arg with EINVAL, so plain load fails *before* streaming
+  a dump into the live GLOBAL tables (it used to die only at promote_db,
+  after overwriting). Restores: `load -update` (verified working) or
+  CRDB-native BACKUP/RESTORE. Verified: dump ok, plain load fails clean
+  with live rows untouched, destroy is a safe no-op.
+- `destroy`/`promote_db` implemented as deliberate no-ops (user call):
+  a shared multi-region realm must not be vaporizable from one admin
+  box, and the plugin never issues DDL; data removal is operator SQL.
+- `e2e/run.sh` grew: backend validation (kdb_crdb.so mapped in both
+  daemons, no db2/klmdb/kldap loaded, no local principal* files,
+  SQL-delete-then-kinit-fails canary proving reads hit CRDB) and a
+  stress phase (STRESS_N=1024 users + 1024 hosts via one batched
+  kadmin.local session, row-count check, >512-row paged listprincs,
+  spot AS/TGS/keytab checks).
+- `e2e/full-cycle.sh`: the whole thing from a clean slate — compose
+  down -v → up → wait for schema → cargo test → e2e/run.sh.
+
+## 2026-07-11 (evening): TLS everywhere + 100 QPS goal → 787 QPS
+
+- **Write-speed fixes** (stress was ~1.4 addprinc/s): (a) 32 parallel
+  kadmin.local workers — GLOBAL commit-wait is latency, not throughput;
+  (b) dev-only `kv.closed_timestamp.lead_for_global_reads_override=25ms`
+  (set by run.sh; `TRUE_LATENCY=1` disables). 25min stress phase → ~5s
+  (435/s creates).
+- **QPS instrumentation**: every phase appends TSV to `e2e/qps.log`
+  (time, git rev, phase, n, secs, rate). Baseline vs now in that file.
+- **TGS 100 QPS goal**: profiling showed the 42.8/s baseline was a
+  client artifact — FILE ccache grows per ticket and re-parse dominates
+  (64 reqs: 86/s small cache vs 47/s at ~470 tickets). Server was never
+  the bottleneck (148/s vs single krb5kdc). Now: `krb5kdc -w 4` (workers
+  each hold own CRDB conn) + 16 parallel kvno clients over 1024 tickets:
+  **787.7/s measured; run.sh FAILS below `TGS_TARGET_QPS` (100)**.
+  Serial latency tracked separately (75/s ≈ 13ms incl. client).
+- **TLS done** (the big "safe" gap): `store.rs` now only skips TLS on
+  explicit `sslmode=disable`; anything else = native-tls with chain +
+  hostname verification (verify-full semantics), `sslrootcert=` parsed
+  out of the URI (rust-postgres doesn't know it), fail-closed on missing
+  cert. No unauthenticated-encryption mode, on purpose. Reconnect path
+  reuses the connector. `tls_uri_parsing` unit test added (11 tests now).
+- **Compose cluster is secure-mode now**: `roach-cert` one-shot generates
+  CA/node/client certs into `e2e/.certs` (gitignored), nodes refuse
+  plaintext, roach-init sets dev passwords (root-dev-pw/krb5kdc-dev-pw),
+  all host access is password over verify-full TLS. e2e asserts
+  `sslmode=disable` is *rejected* by the cluster. cargo test default URI
+  is the secure one, so unit runs exercise TLS too.
+- **Nix gotcha**: plugin's new openssl dep broke dlopen under nix's
+  loader (no system ld cache) — flake now sets RUSTFLAGS rpath to the
+  nix openssl. Symptom was the misleading "plugin symbol
+  'kdb_function_table' not found".
+- Full clean-state cycle green end to end (exit 0): 11 cargo tests,
+  kadmin/ktadd/kinit/kvno, no-BDB/LMDB validation, SQL-canary, TLS
+  enforcement, 2048-principal stress, QPS assert.
+- Still open: alias/referral LookupFlags, policy tl_data (kurbu5
+  upstream), `has_salt` inference, client-cert auth for the plugin
+  (password-over-TLS now; cert auth would drop the password from
+  kdc.conf), maybe prepared-statement caching if read QPS ever matters
+  beyond this.
+
+## 2026-08-16: client-cert auth (no more password in kdc.conf)
+
+- **Cert auth done**: `store.rs` now consumes `sslcert`/`sslkey` from the
+  URI and presents them as the TLS client identity (native-tls). Half a
+  keypair is EINVAL (fail closed, no silent fallback to password).
+  `cockroach cert create-client` emits PKCS#1 keys but native-tls only
+  takes PKCS#8, so the key is re-encoded via the openssl crate (already
+  linked through native-tls — new direct dep in Cargo.toml, no new
+  native dep). compose `roach-cert` now also creates
+  `client.krb5kdc.{crt,key}` (own idempotence guard since old .certs
+  dirs predate it; key chmod 644 = DEV ONLY). `e2e/kdc.conf.in` switched
+  to cert auth — **no secret in the config file**. Tests: 12 now
+  (parse_tls cases for cert/key pairing + live no-password connect).
+- **GOTCHA found the hard way — CRDB license throttling**: the July
+  cluster's data volumes were a month old; CRDB v25.2 without a license
+  throttles concurrently open transactions (SQLSTATE XXC02, "No license
+  installed") once the grace period lapses. Symptom: serial e2e phases
+  pass, the 32-worker stress phase fails ~2/3 of creates with plain
+  "Input/output error" (our EIO mapping hides the SQLSTATE — worth a
+  debug-log hook someday). Fix for dev: recreate the cluster
+  (`docker compose down -v`, or just run `e2e/full-cycle.sh`), which
+  resets the grace period. A registered CockroachDB Free license would
+  fix it properly; not done (needs signup).
+- Full clean-slate cycle green end to end with cert auth (12 cargo
+  tests + full e2e incl. stress and QPS assert).
+- Still open: alias/referral LookupFlags, policy tl_data + `has_salt`
+  (kurbu5 upstream), dump-vs-restore round-trip in CI, prepared-statement
+  caching (optional).
+
+## 2026-08-16 (later): aliases, kurbu5 patches, 1000+ QPS — implementation complete
+
+User direction: finish everything except the dump/restore round-trip test
+(explicitly excluded); caching/perf now REQUIRED with a 1000+ TGS QPS
+floor; explain kurbu5 patches before implementing.
+
+- **Prepared-statement caching** (`store.rs`): Client is now wrapped in a
+  `Conn { client, stmts: HashMap }`; every point query goes through a
+  per-connection prepared-statement cache (rust-postgres re-prepares
+  unnamed statements on every text call, so this removes parse/describe
+  from the hot path). Cache drops with the connection on reconnect.
+- **QPS**: e2e defaults now `krb5kdc -w 8` + 32 parallel kvno clients;
+  `TGS_TARGET_QPS` default raised 100 → 1000 (run.sh FAILS below it).
+  Measured: 1706.7/s (warm cluster), 2048.0/s (fresh cluster full cycle).
+  Serial TGS latency ~95/s (unchanged — that's per-request latency).
+- **Aliases/LookupFlags** (`lib.rs`, `schema.sql`): new operator-managed
+  `aliases` table (GLOBAL, SELECT-only for krb5kdc; no kadmin verbs, like
+  kldap's LDAP-side aliases). get_principal: exact match, then alias
+  lookup; in-realm aliases always returned (entry carries canonical name,
+  KDC decides), out-of-realm canonical = referral, only followed with
+  KRB5_KDB_FLAG_REFERRAL_OK. e2e: TGS via alias, AS via alias with -C
+  (canonicalizes) and without (krb5 >= 1.20 issues under requested name —
+  first test expectation was wrong), out-of-realm alias correctly refused.
+- **kurbu5 vendored at main b52c19e** (user request; was tag v0.1.2) into
+  `vendor/kurbu5` + Cargo `[patch]`, commit recorded in
+  `vendor/kurbu5/.vendored-commit`. kdb crate delta vs 0.1.2 was tiny
+  (c_char cast, changelogs, version 0.1.3); big changes are kurbu5-rs
+  preauth/principal APIs we don't call.
+- **Two accessor patches applied to the vendor tree** (in `patches/`,
+  explained to user before implementing, NOT yet sent upstream):
+  0001 `PolicyEntry::tl_data()` getter → policy TL-data now round-trips
+  (policy wire v2 with trailing tl_data; v1 blobs still decode — see
+  `decode_policy` version dispatch + `policy_v1_blob_still_decodes` test).
+  0002 `KeyDataRef::key_data_ver()/has_salt()` → `has_salt` now read from
+  the entry instead of inferred from salt presence.
+- Tests 12 → 14 (policy tl_data round-trip, v1 back-compat). Full clean
+  cycle green: 14 cargo tests + full e2e incl. alias suite and the
+  1000 QPS gate.
+- Next: send patches/ upstream to kurbu5 (codeberg), then re-pin to a
+  released tag and drop vendor/. Excluded by user: dump/restore CI test.
+
+## 2026-08-16 (evening): 8.4k TGS QPS (target was 4-5k for 200K machines)
+
+User goal: ≥2x the 2k number, sized for 200K machines / 4-5k QPS worst
+case. Landed at ~8k-8.4k measured, gate raised to 4000.
+
+- **Bench honesty first**: kvno-based parallel load was benchmarking
+  fork/exec + FILE-ccache re-parse, not the KDC. New `e2e/tgsbench.c`:
+  N threads hot on krb5_get_credentials(KRB5_GC_NO_STORE), per-thread
+  MEMORY ccache (the shared FILE cc takes an fcntl lock per read and
+  serializes threads). qps.log phase renamed read_tgs_kvno_parallel →
+  read_tgs_bench (numbers not comparable).
+- **Bottleneck hunt** (numbers on this 16-core box, 3-node docker CRDB):
+  2.2k/s w/ kvno load → 3.5k/s w/ tgsbench, plateaued regardless of
+  -w 16/32/48; nothing CPU-bound (workers ~19%, CRDB ~1 core). Cause:
+  every TGS-REQ = **3 sequential get_principal round-trips** (measured
+  3.00 SELECTs/req via crdb node_metrics; names via temp debug print:
+  krbtgt/REALM, service, client — client lookup is the 1.20+ PAC path),
+  at ~1.4ms p75 per SELECT under load (CRDB service latency histogram).
+  Sync round-trips × single-threaded workers = latency wall.
+- **Fix: per-process TTL entry cache in lib.rs** (`EntryCache`), KDC
+  role ONLY (kadmind/kdb5_util never cache — read-modify-write must stay
+  fresh). `entry_cache_ms` profile/db_args knob, default 1000, 0=off.
+  Local writes invalidate; cross-worker staleness bounded by TTL; misses
+  never cached; 64k-entry coarse wipe bound. e2e canary now sleeps 1.2s
+  after the SQL delete (staleness contract made explicit in kdc.conf.in).
+- **Results** (tgsbench 128 threads / 65k reqs, err=0 everywhere):
+  16 workers 8196/s, 32 workers 7744/s → now CPU-bound like stock;
+  KDC_WORKERS default stays 16. Full-cycle fresh cluster: 8402/s.
+  Serial latency 94.8 → 134.7/s (krbtgt+client now cache hits).
+- **Stock-krb5 baseline** (subagent, same box/bench, db2 backend):
+  13.8k/s at -w 16, 9.9-10.1k/s at -w 32. So kdb-crdb is now at ~60% of
+  stock BDB while being strongly consistent + multi-region. Remaining
+  gap = residual cache-miss SELECTs (each worker refetches each hot
+  entry once per TTL) + AES vs file-read cost.
+- Headroom if ever needed: longer TTL, multi-host connection_uri with
+  per-process gateway spread across CRDB nodes, kurbu5 async KdbModule.
+- For the 200K-machine sizing: worst case 4-5k QPS is met 2x over on ONE
+  16-core dev box also running the whole 3-node cluster; production
+  regions add KDCs horizontally (shared-nothing except CRDB).
+
+## 2026-08-16 (night): deployed to sea1 kubernetes (ns tmp-crdb-krb5)
+
+Everything under k8s/ (manifests + secrets material, .gitignore-grade
+files chmod 600: .registry-pass, .master-pass, .admin-pass, .crdb-certs/,
+.bootstrap/). Cluster: 3x Talos metal (72 cores / 754Gi / 1.8T NVMe).
+
+- **Registry**: Talos containerd refuses plain-HTTP registries and we
+  have no machine-config access, so the dev-box registry idea was
+  replaced by an in-cluster one: registry:2 + ceph-rbd PVC behind
+  traefik at registry-tmp-crdb.owo.me (cert-manager letsencrypt-genprog,
+  cloudflare-proxied OFF — CF proxy caps layer uploads), htpasswd auth
+  (creds k8s/.registry-pass, k8s secret "regcred" for pulls). Push from
+  dev box with skopeo (dockerd would need insecure-registry config;
+  skopeo doesn't).
+- **CRDB**: official Helm chart, release "crdb", 3 nodes (chart
+  anti-affinity put one per metal node), TLS self-signer,
+  storage local-path (node NVMe /var/mnt/data), 200Gi each,
+  locality region=sea1. Schema: k8s/schema-sea1.sql (single region, no
+  SURVIVE REGION FAILURE — needs >=3 regions; tables stay GLOBAL).
+  krb5kdc SQL user + client cert signed from the chart CA secret
+  (cockroach cert via docker; chart CA lifetime forced --lifetime=8760h).
+- **KDC image**: nix closure (krb5 1.22.2 + openssl + bash, 118MB) +
+  target/release/libkdb_crdb.so at /opt/kdb, FROM scratch →
+  registry-tmp-crdb.owo.me/kdc:v1. Same store paths as the dev bench.
+- **Realm bootstrap from the dev box**: kubectl port-forward to
+  crdb-public + local kdb5_util create -s (chart node certs include
+  localhost SAN, so verify-full works through the forward). Stash →
+  secret kdc-stash; admin/admin created (pw k8s/.admin-pass).
+- **KDCs**: k8s/kdc.yaml — Deployment x3, REQUIRED podAntiAffinity on
+  kubernetes.io/hostname (verified 1 pod per node), krb5kdc -n -w 16,
+  unprivileged 8888 with Service kdc:88, entry_cache_ms=1000, kadmind x1
+  (service kadmind:749). PodSecurity "restricted" satisfied (nonroot,
+  no caps, seccomp). Smoke: kinit admin/admin via the kdc Service issued
+  a TGT (AS_REQ ISSUE in pod logs).
+- Gotchas hit: kubectl port-forward dies between shells (plugin EIO =
+  connection refused — restart it before blaming TLS); registry:2 needs
+  htpasswd secret BEFORE deploy; PodSecurity is warn-only here but
+  manifests comply anyway.
+- Next: in-cluster tgsbench pod(s) for a cluster-scale QPS run
+  (provision principals through kadmind or direct SQL), then a
+  Grafana/monitoring pass, then teardown or keep as demo realm.
+
+## 2026-08-16 (late night): 262k burn-test principals + cluster perf numbers
+
+Dataset (user spec): 4 /16s of host/A.B.C.D principals = **262,144**
+(host/10.100.0.0 … host/10.103.255.255), created with -randkey via
+parallel kadmin.local in the loadgen pod (k8s/loadgen.yaml, image kdc:v3
+= v1 + tgsbench + coreutils/grep/gawk; kadmin.local needs `-p` in this
+image — no /etc/passwd for uid 1000). Row count verified via SQL.
+
+**Write performance** (creates/s, kadmin.local addprinc -randkey):
+| config                                   | 32 workers | 128 workers |
+|------------------------------------------|-----------:|------------:|
+| GLOBAL table, cluster defaults           |       39/s |     (~150)  |
+| GLOBAL + lead_for_global_reads=25ms      |      891/s |     3,560/s |
+| REGIONAL BY TABLE, defaults              |    3,978/s |         —   |
+- Default GLOBAL write latency ≈ 820ms/op = the commit-wait, exactly as
+  README warns. The 25ms override is THE bulk-load lever (full 262k load
+  ran at **4,045/s sustained, 64.8s total**). REGIONAL matches it with no
+  override — on a single-region cluster GLOBAL buys nothing for reads
+  and costs writes; multi-region prod is where GLOBAL earns its keep.
+- Gotcha: first REGIONAL measurement (86/s) was garbage — taken during
+  post-ALTER replica rebalancing. Re-measure after zone-config jobs
+  settle. (Raw UPSERT sanity check: 5-12ms.)
+- Cluster restored to prod shape afterwards: LOCALITY GLOBAL, override
+  RESET, test ranges (10.96-99, tmp-*) deleted. 262,149 rows total.
+
+**Read performance** (tgsbench ip:10.100 mode, random over all 262k —
+service-entry cache hit rate ~1%, so ~1 real CRDB read per TGS):
+- 1 bench pod → kdc Service (UDP): 3,657/s, and per-pod TGS counts were
+  18k/0/10k — cilium UDP flows do NOT spread evenly, and one KDC pod
+  carried most load at only ~0.8 cores (16 workers latency-bound).
+- Fixes: krb5kdc -w 16 → 48 (I/O-bound workers; also needed
+  maxSurge=0/maxUnavailable=1 — a surge pod can never schedule with
+  required anti-affinity on 3 nodes), bench pinned per-KDC via 3
+  krb5.confs (what DNS SRV does for a real fleet).
+- Result: **40,577 TGS/s aggregate, 196,608 requests, err=0**
+  (3 × 128 threads, one tgsbench per KDC pod).
+- krb5.conf gotcha: `REALM = { kdc = x }` on one line is invalid profile
+  syntax and fails every request instantly; the brace needs newlines.
+
+Verdict vs the 200K-machine / 4-5k QPS worst case: cluster serves ~8-10x
+that with 3 KDC pods, and writes can bulk-load a full fleet's keytabs in
+about a minute with the override set. Left running: loadgen pod, bench
+user (bench/bench-pw), KDCs at -w 48.
+
+## 2026-08-16 (later still): chaos suites — auth survives quorum loss & split brain
+
+New plugin capability: **degraded-read fallback** (`stale_reads_ms`, KDC
+role only, default off). When primary reads fail (quorum loss), reads
+retry as CRDB bounded-staleness follower reads
+(`AS OF SYSTEM TIME with_max_staleness('Xms', true)`) — servable by any
+live replica, no quorum. A circuit breaker (5s hold) routes straight to
+stale reads while degraded so QPS doesn't die on statement_timeouts
+(1.5s, set on KDC conns only). kadmind/kdb5_util never see stale rows.
+Second capability found necessary on k8s: **multi-host connection_uri**
+(host1,host2,host3) with per-process rotation — first chaos run FAILED
+phase 2 because quorum loss makes every CRDB pod unready, the public
+Service empties, and reconnects had nowhere to go. Fix: kdc.conf lists
+all three pod DNS names (headless svc resolves regardless of readiness)
++ connect_timeout=3; plugin rotates order per process (spreads gateways)
+and reconnect walks the list. Tests: 16 cargo (rotation, stale-path).
+
+**Codified suites**:
+- `e2e/chaos.sh` (compose; now step 5 of full-cycle.sh): baseline → 1
+  node down → 2 down (quorum gone) → recovery. Asserts kinit+kvno each
+  phase, QPS floor (CHAOS_QPS_FLOOR, default 1000), writes REFUSED
+  without quorum, writes recover after. Results: 7264/s one-down,
+  2892/s quorum-lost (single compose node).
+- `k8s/chaos-test.sh` (metal; CHAOS_QPS_FLOOR default 4000): same
+  phases via sts scaling, PLUS **split brain** — k8s/split-brain-netpol
+  .yaml isolates every CRDB pod from its peers (clients still reach all
+  three, no node has quorum). Results (48w KDCs, v5 image):
+  baseline 37,195/s · one-down 36,850/s · quorum-gone single CRDB node
+  9,186/s · split-brain 8,713/s — all err=0, writes refused while
+  degraded, clean recovery + writes after heal.
+
+Gotchas: k8s conntrack keeps established conns alive after endpoints go
+unready — do NOT rely on it, that's what multi-host is for; sts
+scale-down is instant but scale-up needs wait_crdb_ready before write
+asserts; chaos pod scripts need `set -e` or failures masquerade as OK
+(first run "passed" auth with a dead ccache).
+
+## 2026-08-16 (wee hours): ansible/ — multi-region CRDB deploy playbook
+
+New `ansible/` tree: deploys + clusters CRDB across regions on plain
+hosts (systemd path — deliberately NOT multi-cluster k8s; see the
+tooling discussion: the new CockroachDB operator can't span k8s
+clusters yet, and VMs are operationally simpler for a fixed-size DB).
+**Inventory hostvars ARE the topology**: crdb_region/crdb_zone drive
+--locality, cross-region --join seeds (2 per region, by IP — no
+cross-region DNS needed), and the schema DDL is TEMPLATED from the
+inventory (PRIMARY REGION / ADD REGION IF NOT EXISTS per region /
+SURVIVE REGION FAILURE when >= 3 regions) — adding a region = adding
+hosts + re-run. Roles: crdb_certs (controller-local CA via `cockroach
+cert`, per-node + client.root + client.krb5kdc certs; per-host include
+because create-node always writes node.crt — a plain loop clobbers all
+but the last), crdb_node (binary, certs, systemd unit, NTP assert),
+crdb_init (idempotent init + liveness wait), crdb_schema (render+apply+
+verify SHOW REGIONS). site.yml ends with an under-replicated-ranges
+gate; upgrade.yml does serial drain/upgrade/restart. render-test.yml
+smoke-renders join/locality/DDL with no remote connections — validated
+against the 3x3 example inventory; both playbooks pass syntax check.
+Not yet: real end-to-end run (needs VMs or a docker-as-hosts molecule
+rig), decommission playbook, backups. Certs land in ansible/secrets/
+(CA key — vault it).
+
+## 2026-08-16 (later): terraform/hcloud substrate + docs/runbooks.md
+
+- **terraform/hcloud/**: 9x Ubuntu 24.04 (topology var: fsn1/nbg1/hel1
+  x3, cpx41) with ONE private network across all three locations (all
+  eu-central zone — CRDB never touches public net; firewall = SSH+ICMP
+  only), spread placement groups per region (3 nodes = 3 physical
+  hosts), cloud-init (chrony, containerd, python3, sysctls), and
+  generated ansible/inventory/hcloud/ (public IP = ansible_host,
+  private IP = crdb_advertise, location = crdb_region). tofu validate
+  clean; local.nodes/cidrhost math verified via console (10.90.<r>.1x).
+  Apply needs HCLOUD_TOKEN (not present on this box yet). ~$0.55/hr
+  fleet at defaults; README covers tc-netem fake-WAN trick.
+- SCRAPPED 2026-08-16: terraform/hcloud (user's Hetzner account is
+  capped at 5 servers; we need 9). Replaced by ansible/aws/ — see next
+  entry. The tc-netem fake-WAN trick from its README still applies
+  anywhere.
+- **docs/runbooks.md** (subagent): add node / add region / replace-or-
+  remove node (yes: cockroach node decommission; add-then-decommission
+  for replace; dead-node flow for hardware loss). Agent review caught a
+  REAL playbook footgun: the unit-template restart handler would have
+  parallel-restarted the whole cluster on any inventory change (join
+  list is baked into the unit). Fixed: crdb_node no longer notifies
+  restarts at all — upgrade.yml (serial drain) is the only restart
+  path; comment in the role explains why. Also noted: schema/verify
+  plays pin to groups['crdb'][0] (mind --limit), stashed node certs
+  need manual pruning on node removal, decommission.yml still TODO.
+
+## 2026-08-16 (later): AWS spot substrate — built as ansible/aws/, then
+## PORTED TO terraform/aws/ (user misspoke: meant Terraform all along)
+
+The Ansible-owned version described below was built first, validated,
+then replaced 1:1 by terraform/aws/ (same VPCs/peering-mesh/spot/
+inventory-render design; 3 fixed provider aliases since TF can't loop
+providers; spot via aws_instance instance_market_options; region module
++ explicit 3-pair peering.tf). ansible/aws/ is GONE; terraform/aws
+passes tofu validate. Division of labor now: Terraform owns cloud
+resources, the Ansible playbook owns everything from SSH inward and
+still derives all topology from the generated inventory.
+
+Later same session: region corrected us-west-1 → us-west-2 (PDX;
+bigger region, 4 AZs, has c8a AND cheap Graviton pools). Ubuntu bumped
+to 26.04 (codename-agnostic AMI filter). Graviton evaluated with LIVE
+spot prices (creds now on box via .env/direnv):
+  fleet $/hr (9x xlarge): c7a $0.64 · c7g $0.47 (-23%) · c8g $0.51
+  (-17%); c8g is the cheapest single instance anywhere (usw2 $0.0497).
+Arch made a first-class variable end to end: TF `arch` (AMI) +
+`crdb_arch` (written into generated group_vars), and fixed a latent
+playbook bug — crdb_certs now uses `crdb_local_arch` (controller is
+x86 even when the fleet is ARM). Full `tofu plan` against live AWS
+with c8g/arm64/26.04: 56 to add, zero errors. SSH key comes from the
+agent (ssh-add -L) — no ~/.ssh/*.pub on this box. Reminder: KDC image
++ tgsbench closures are x86; ARM nodes are fine as DB-only, build an
+aarch64 closure before putting KDC containers on them.
+
+## 2026-08-16 (dawn): LIVE AWS 3-region burn — write numbers in, read burn cut short, infra destroyed
+
+Fleet: 9x c8g.xlarge SPOT (Graviton4, arm64, Ubuntu 26.04) across
+us-east-1/2 + us-west-2, gp3 3000/125 (sizing math in terraform vars),
+~$0.51/hr. tofu apply + site.yml end to end.
+
+**Ansible validated live** — 3 real fixes: `stdout_lines[-1]` →
+`| last` (2.21 templater), under-replicated column moved into
+kv_store_status `metrics` JSON in v25, and (from the burn) SG lacked
+8888 (added to TF). Cluster: 9/9 nodes, correct localities, 0
+under-replicated. ARM plugin built ON a node via nix develop (flake
+already had aarch64; had to add cargo/rustc — dev box was silently
+using rustup's). Realm bootstrapped from us-east-1 node.
+
+**WRITE NUMBERS (recorded; the real multi-region physics)**:
+- serial addprinc, cluster defaults: **984 ms/create** (GLOBAL
+  commit-wait, ~70ms max-RTT topology)
+- 32 workers, defaults: **38/s**
+- 32 workers, lead override 25ms: **826/s**
+- full load, 128 workers, override: **262,144 in 80.9s = 3,241/s**,
+  count verified via SQL, override RESET after.
+
+**READ BURN: not completed** — first attempt failed err=100% because
+SG had no 8888 rule (kinit blackholed; fixed in TF module). Then
+us-east-2's c8g spot pool churned: use2-1 reclaimed 04:14 GMT
+(mid-setup), use2-0 reclaimed ~30 min later. Recovery worked exactly
+per runbook both times (tofu apply recreates by name; prune stale node
+cert — new private IP! — re-run site.yml; joined clean; dead stores
+were NOT yet decommissioned). use2 KDC was up again and 3-region bench
+armed when user called teardown. `tofu destroy`: 56/56 resources,
+verified 0 instances in all 3 regions.
+
+Lessons recorded: (1) us-east-2 c8g spot churns — mix families per
+region (instance_type_overrides) for real burns; (2) spot reclaim +
+runbook-3 recovery is genuinely smooth; (3) krb5 "plugin symbol
+kdb_function_table not found" ALSO means plain file-not-found
+(db_module_dir must point at the dir CONTAINING kdb_crdb.so); (4) ssh
+background daemons need setsid + </dev/null or the session hangs.
+
+Original (superseded) ansible/aws/ design notes:
+- provision.yml: per region (vars.yml aws_regions: us-east-1/2,
+  us-west-1, 10.91-93/16) — VPC, subnets across <=3 AZs (us-west-1 only
+  exposes 2; instances round-robin AZs for spot-pool diversity), IGW,
+  SG (SSH public, 26257/8080 mesh-CIDRs only), key pair, Ubuntu 24.04
+  AMI lookup, launch template with SPOT market options
+  (aws_instance_type var + per-region instance_type override;
+  aws_spot=false for on-demand), N ec2_instances (name-tag idempotent).
+  Then FULL cross-region VPC peering mesh (request + accept + pcx
+  routes both ways in every RTB) and renders inventory/aws/ for
+  site.yml (public IP = ansible_host, private = crdb_advertise,
+  region = crdb_region, AZ = crdb_zone, ansible_user=ubuntu).
+- destroy.yml + tasks/region_destroy.yml: full reverse teardown by
+  project tag (instances, launch templates, peerings, SG/RTB/subnets/
+  IGW/key/VPC).
+- requirements.yml: amazon.aws + community.aws (ec2_vpc_peer lives in
+  community). Controller needs boto3.
+- Both playbooks pass syntax check; NOT yet run live — no AWS creds on
+  this box. Cost at defaults 9x c7a.xlarge spot ~= $0.70/hr.
+- Caveats in aws/README.md: spot vCPU quota check for new accounts,
+  c8a absent in us-west-1, peering mesh is O(n^2) — Transit Gateway
+  territory at 4+ regions, re-run provision.yml after a spot reclaim
+  to recreate instances + refresh inventory (public IPs change).
+
+## 2026-08-16: repo hygiene — gitignore hardening + first commits
+
+Prepped the tree for its first real commits. Hardened .gitignore before
+staging anything: .env (AWS creds), ansible/secrets/ (cluster CA key +
+node/client keys), k8s/.crdb-certs + k8s/.{admin,master,registry}-pass +
+.registry-htpasswd + .bootstrap/, e2e/.certs + .state (keytabs),
+terraform state/backup + .terraform/, ansible/inventory/aws/ (terraform-
+generated, live IPs), ansible/.cache, image-build/rootfs/ (~139MB copied
+nix store — only the Dockerfile is tracked). Verified via git
+check-ignore; no secret material is in any commit. No remote configured
+yet — nothing has been pushed anywhere.
+
+Committed in layers: vendored kurbu5 + patches, core plugin, e2e suite +
+compose, k8s/sea1 + image-build, terraform + ansible, docs. Next
+concrete step is unchanged from HANDOFF.md: redo the AWS 3-region read
+burn, then upstream the two kurbu5 patches.
