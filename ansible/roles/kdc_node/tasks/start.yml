@@ -23,12 +23,14 @@
 
 - name: Smoke test — AS-REQ against this node's KDC
   ansible.builtin.shell:
+# NB: keep every folded line at the SAME indent — a deeper-indented
+# continuation makes YAML keep its newlines, which once turned this
+# kinit into a principal-less one (defaulted to root@, smoke failed).
     cmd: >-
       set -o pipefail;
-      printf '%s\n' "$KDC_ADMIN_PW"
-      | podman exec -i krb5kdc kinit -c /tmp/ansible-smoke
-        {{ kdc_admin_principal }}@{{ kdc_realm }}
-      && podman exec krb5kdc kdestroy -c /tmp/ansible-smoke
+      printf '%s\n' "$KDC_ADMIN_PW" |
+      podman exec -i krb5kdc kinit -c /tmp/ansible-smoke {{ kdc_admin_principal }}@{{ kdc_realm }} &&
+      podman exec krb5kdc kdestroy -c /tmp/ansible-smoke
     executable: /bin/bash
   environment:
     KDC_ADMIN_PW: "{{ lookup('password', kdc_local_secrets + '/kdc-admin-pass length=32 chars=ascii_letters,digits') }}"
