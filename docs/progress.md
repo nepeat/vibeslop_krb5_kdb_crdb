@@ -1060,3 +1060,17 @@ a 262k-machine realm gets hot-set coverage only — deliberate, but worth a
 decision if someone wants full-realm cold-start coverage. (3) kadmind
 still cannot start during an outage (no offline cache for admin roles) —
 intended, documented, not revisited.
+
+## 2026-08-16: measured — what the entry cache is worth (user asked)
+
+A/B/A/B on the compose e2e realm (-w 16, 64 threads, 32k TGS-REQs over
+1024 hosts): entry_cache_ms=1000 -> 7.3-7.9k TGS/s at ~3.9ms serial;
+entry_cache_ms=0 -> 2.8k TGS/s at ~7.2ms serial. The cache is worth
+~2.7x throughput and halves per-request latency; without it every
+lookup is a CRDB round trip and DB read load triples. Cache-off also
+fails the single-box 4000 QPS e2e gate (fleet aggregate would still
+clear it). Verdict recorded: staleness with the cache is already
+proven bounded <=TTL+slack on every KDC (safety suite phase 3), and a
+1s window is noise against 10h ticket lifetimes — revocation latency
+is dominated by tickets, not this cache. Not removing it; 0 remains a
+supported per-deployment knob.
