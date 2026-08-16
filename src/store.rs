@@ -16,11 +16,15 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use kurbu5_kdb_rs::KdbError;
 use native_tls::{Certificate, Identity, TlsConnector};
 use postgres::{Client, NoTls, Statement};
 use postgres_native_tls::MakeTlsConnector;
+
+use crate::offline::{Hit, OfflineCache};
+use crate::warn;
 
 const MAX_RETRIES: usize = 8;
 
@@ -63,8 +67,27 @@ enum Tls {
     Verified(MakeTlsConnector),
 }
 
+/// Everything open() decides for the connection layer. Grown into a
+/// struct rather than a fourth positional argument to `connect_with`.
+#[derive(Default)]
+pub struct StoreOpts {
+    /// See `Store::stale_ms`.
+    pub stale_ms: u64,
+    /// Budget (ms) for the initial connect and, capped, for per-request
+    /// reconnects. 0 = fail fast on the first attempt (historic default).
+    pub startup_retry_ms: u64,
+    /// Last-known-good cache; Some() also means a DB-less start is
+    /// survivable instead of fatal (KDC role only — lib.rs gates that).
+    pub offline: Option<OfflineCache>,
+}
+
 pub struct Store {
-    conn: Mutex<Conn>,
+    /// None = not currently connected. A connection is established
+    /// lazily so a KDC with an offline cache can start during an outage:
+    /// a NEW SQL session to a quorum-less CRDB node is impossible (its
+    /// own user lookup needs writes), so "connect at open() or die" is
+    /// exactly the wrong policy for a restart-during-outage.
+    conn: Mutex<Option<Conn>>,
     uri: String,
     tls: Tls,
     /// Max read staleness (ms) for the degraded-read fallback; 0 = off.
@@ -80,7 +103,16 @@ pub struct Store {
     /// first until this instant, then probe the primary again. Without
     /// it every request would eat a full statement_timeout before
     /// falling back, cratering QPS during the outage.
-    degraded_until: Mutex<Option<std::time::Instant>>,
+    degraded_until: Mutex<Option<Instant>>,
+    /// Per-request reconnect budget (ms), derived from
+    /// `startup_retry_ms`. Deliberately small: a hung DB must not wedge a
+    /// KDC worker for the whole startup budget on every request.
+    request_retry_ms: u64,
+    /// Second circuit breaker, for reconnects: while disconnected, only
+    /// one request per hold window pays a connect attempt; the rest fail
+    /// straight through to the offline cache.
+    connect_hold_until: Mutex<Option<Instant>>,
+    offline: Option<OfflineCache>,
 }
 
 /// Fail primary statements fast when the fallback exists; quorum-less
@@ -88,6 +120,40 @@ pub struct Store {
 const DEGRADED_STMT_TIMEOUT_MS: u64 = 1500;
 /// How long to stay on stale reads before re-probing the primary.
 const DEGRADED_HOLD_MS: u64 = 5000;
+/// Connect backoff: first wait, and the cap it doubles up to.
+const CONNECT_BACKOFF_MS: u64 = 250;
+const CONNECT_BACKOFF_MAX_MS: u64 = 2000;
+/// Ceiling on the per-request reconnect budget regardless of how large
+/// `startup_retry_ms` is — a KDC worker blocked here is a worker not
+/// answering AS-REQs.
+const REQUEST_RETRY_CAP_MS: u64 = 2000;
+/// While disconnected, re-probe the DB at most this often.
+const CONNECT_HOLD_MS: u64 = 5000;
+
+/// KRB5KDC_ERR_SVC_UNAVAILABLE (krb5.h: ERROR_TABLE_BASE_krb5 + 29).
+/// Spelled out because kurbu5 does not re-export the krb5 error table;
+/// the value is the wire protocol's error number 29 and is ABI-stable.
+const KRB5KDC_ERR_SVC_UNAVAILABLE: i32 = -1765328355;
+
+/// The error a KDC-role lookup returns when the database is unreachable
+/// and the offline cache cannot answer (miss OR past max age).
+///
+/// It is deliberately NOT `NoEntry`. The offline cache is partial by
+/// construction — it holds only what this KDC happened to read — so
+/// answering a miss with NoEntry would make libkdb5 emit
+/// KDC_ERR_C_PRINCIPAL_UNKNOWN and tell a client that a principal which
+/// exists does not. The KDC passes protocol-range codes through to the
+/// client, so this surfaces as KDC_ERR_SVC_UNAVAILABLE: "try later",
+/// which is the truth.
+pub fn offline_unavailable() -> KdbError {
+    KdbError::Custom(KRB5KDC_ERR_SVC_UNAVAILABLE)
+}
+
+/// True for the error above (lib.rs uses it to decide whether a lookup
+/// miss may still be chased through the alias table).
+pub fn is_unavailable(e: &KdbError) -> bool {
+    matches!(e, KdbError::Custom(c) if *c == KRB5KDC_ERR_SVC_UNAVAILABLE)
+}
 
 /// Split TLS-related params out of the URI: rust-postgres does not
 /// understand `sslrootcert`/`sslcert`/`sslkey` (and only knows sslmode
@@ -226,26 +292,116 @@ impl Store {
     /// `sslrootcert` (or the system trust store if unset). The blobs are
     /// ciphertext, but principal names/metadata should not transit
     /// plaintext, and the KDC must authenticate the cluster it trusts.
+    ///
+    /// This spelling is fail-fast with every extra behaviour off; only
+    /// the tests take it now, open() goes through `connect_opts`.
+    #[allow(dead_code)]
     pub fn connect(uri: &str) -> Result<Self, KdbError> {
         Self::connect_with(uri, 0)
     }
 
     /// `stale_ms` > 0 enables the degraded-read fallback (see field doc).
+    #[allow(dead_code)]
     pub fn connect_with(uri: &str, stale_ms: u64) -> Result<Self, KdbError> {
+        Self::connect_opts(uri, StoreOpts { stale_ms, ..StoreOpts::default() })
+    }
+
+    pub fn connect_opts(uri: &str, opts: StoreOpts) -> Result<Self, KdbError> {
         // Multi-host URIs (host1:p,host2:p,...) are tried in order by
         // rust-postgres; rotate the list per process so a fleet of KDC
         // workers spreads gateways instead of all picking host1, and so
         // reconnect after a node death naturally walks to a survivor.
+        // Every connect attempt below re-walks that whole list.
         let uri = rotate_hosts(uri, std::process::id() as usize);
         let (clean_uri, tls) = parse_tls(&uri)?;
-        let client = Self::open_client(&clean_uri, &tls, stale_ms)?;
+        let conn = match Self::open_client_retrying(
+            &clean_uri,
+            &tls,
+            opts.stale_ms,
+            opts.startup_retry_ms,
+            "startup",
+        ) {
+            Ok(client) => Some(Conn::new(client)),
+            // With a last-known-good cache the KDC is expected to come up
+            // anyway and serve from it — crash-looping through systemd/
+            // k8s backoff would only delay recovery. Without one, keep
+            // the historic fail-fast behaviour.
+            Err(_) if opts.offline.is_some() => {
+                warn(
+                    "starting WITHOUT a database connection; serving from \
+                     the offline cache until CRDB is reachable",
+                );
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(cache) = &opts.offline {
+            warn(&format!(
+                "offline cache loaded: {} entries",
+                cache.entry_count()
+            ));
+        }
         Ok(Store {
-            conn: Mutex::new(Conn::new(client)),
+            conn: Mutex::new(conn),
             uri: clean_uri,
             tls,
-            stale_ms,
+            stale_ms: opts.stale_ms,
             degraded_until: Mutex::new(None),
+            request_retry_ms: opts
+                .startup_retry_ms
+                .min(REQUEST_RETRY_CAP_MS),
+            connect_hold_until: Mutex::new(None),
+            offline: opts.offline,
         })
+    }
+
+    /// Connect, retrying with capped exponential backoff until `budget_ms`
+    /// is spent. `budget_ms == 0` is a single attempt (the default), so
+    /// nothing changes for operators who never set `startup_retry_ms`.
+    /// Sleeps between attempts — no busy-spin, no helper thread (a KDC
+    /// worker is one synchronous loop and must stay that way).
+    fn open_client_retrying(
+        uri: &str,
+        tls: &Tls,
+        stale_ms: u64,
+        budget_ms: u64,
+        what: &str,
+    ) -> Result<Client, KdbError> {
+        let deadline = Instant::now() + Duration::from_millis(budget_ms);
+        let mut backoff = Duration::from_millis(CONNECT_BACKOFF_MS);
+        let mut attempt = 1u32;
+        loop {
+            match Self::open_client(uri, tls, stale_ms) {
+                Ok(c) => {
+                    if attempt > 1 {
+                        warn(&format!(
+                            "{what}: connected on attempt {attempt}"
+                        ));
+                    }
+                    return Ok(c);
+                }
+                Err(e) => {
+                    if budget_ms == 0 || Instant::now() + backoff >= deadline {
+                        if budget_ms > 0 {
+                            warn(&format!(
+                                "{what}: no connection after {attempt} \
+                                 attempts ({budget_ms}ms budget)"
+                            ));
+                        }
+                        return Err(e);
+                    }
+                    warn(&format!(
+                        "{what}: connect attempt {attempt} failed, retrying \
+                         in {}ms",
+                        backoff.as_millis()
+                    ));
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2)
+                        .min(Duration::from_millis(CONNECT_BACKOFF_MAX_MS));
+                    attempt += 1;
+                }
+            }
+        }
     }
 
     fn open_client(
@@ -277,14 +433,13 @@ impl Store {
             .lock()
             .ok()
             .and_then(|g| *g)
-            .is_some_and(|t| std::time::Instant::now() < t)
+            .is_some_and(|t| Instant::now() < t)
     }
 
     fn set_degraded(&self) {
         if let Ok(mut g) = self.degraded_until.lock() {
             *g = Some(
-                std::time::Instant::now()
-                    + std::time::Duration::from_millis(DEGRADED_HOLD_MS),
+                Instant::now() + Duration::from_millis(DEGRADED_HOLD_MS),
             );
         }
     }
@@ -351,8 +506,52 @@ impl Store {
         }
     }
 
-    /// Run `f` with the connection, reconnecting once on connection loss
-    /// and retrying on serialization failures with capped exponential
+    /// Establish the connection if the slot is empty, honouring the
+    /// reconnect breaker so an outage costs one connect attempt per hold
+    /// window instead of one per request.
+    fn ensure_conn<'a>(
+        &self,
+        slot: &'a mut Option<Conn>,
+    ) -> Result<&'a mut Conn, KdbError> {
+        if slot.is_none() {
+            if self
+                .connect_hold_until
+                .lock()
+                .ok()
+                .and_then(|g| *g)
+                .is_some_and(|t| Instant::now() < t)
+            {
+                return Err(KdbError::Io(libc::EIO));
+            }
+            match Self::open_client_retrying(
+                &self.uri,
+                &self.tls,
+                self.stale_ms,
+                self.request_retry_ms,
+                "reconnect",
+            ) {
+                Ok(client) => {
+                    *slot = Some(Conn::new(client));
+                    if let Ok(mut g) = self.connect_hold_until.lock() {
+                        *g = None;
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut g) = self.connect_hold_until.lock() {
+                        *g = Some(
+                            Instant::now()
+                                + Duration::from_millis(CONNECT_HOLD_MS),
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        slot.as_mut().ok_or(KdbError::Io(libc::EIO))
+    }
+
+    /// Run `f` with the connection, reconnecting on connection loss and
+    /// retrying on serialization failures with capped exponential
     /// backoff. Reconnect swaps in a fresh Conn, which drops the statement
     /// cache with the dead session.
     fn with_retry<T>(
@@ -362,23 +561,21 @@ impl Store {
         let mut guard = self.conn.lock().map_err(|_| KdbError::Locked)?;
         let mut backoff_ms = 5u64;
         for attempt in 0..MAX_RETRIES {
-            match f(&mut guard) {
+            let (res, closed) = {
+                let conn = self.ensure_conn(&mut guard)?;
+                let res = f(conn);
+                let closed = res.is_err() && conn.client.is_closed();
+                (res, closed)
+            };
+            match res {
                 Ok(v) => return Ok(v),
                 Err(e) if is_retryable(&e) && attempt + 1 < MAX_RETRIES => {
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        backoff_ms,
-                    ));
+                    std::thread::sleep(Duration::from_millis(backoff_ms));
                     backoff_ms = (backoff_ms * 2).min(200);
                 }
-                Err(e) if guard.client.is_closed() => {
-                    // One reconnect attempt, then replay.
-                    let _ = e; // original error superseded
-                    *guard = Conn::new(Self::open_client(
-                        &self.uri,
-                        &self.tls,
-                        self.stale_ms,
-                    )?);
-                }
+                // Dead session: drop it and let the next iteration
+                // reconnect (walking the multi-host list), then replay.
+                Err(_) if closed => *guard = None,
                 Err(e) => return Err(pg_err(&e)),
             }
         }
@@ -394,21 +591,51 @@ impl Store {
         // The AS/TGS hot path. On a GLOBAL table this is a strongly
         // consistent read served by the local region: no WAN round-trip.
         // Prepared once per connection: no parse/describe per request.
-        // Falls back to a bounded-staleness read when quorum is gone.
-        self.read_with_fallback(
+        // Falls back to a bounded-staleness read when quorum is gone, and
+        // — only if the DB is unreachable outright — to the offline
+        // last-known-good cache underneath that.
+        let got = self.read_with_fallback::<Vec<u8>>(
             "SELECT entry FROM principals WHERE name = $1",
             name,
-        )
+        );
+        let Some(cache) = &self.offline else { return got };
+        match got {
+            Ok(Some(blob)) => {
+                cache.note_entry(name, &blob);
+                Ok(Some(blob))
+            }
+            // A real "no such row" from a reachable DB stays NoEntry-ish;
+            // misses are never cached (a cached miss would outlive a
+            // create by the whole max age).
+            Ok(None) => Ok(None),
+            Err(_) => match cache.get_entry(name) {
+                Hit::Fresh(blob) => Ok(Some(blob)),
+                // Expired or absent: fail closed, and NEVER as NoEntry.
+                Hit::Expired | Hit::Miss => Err(offline_unavailable()),
+            },
+        }
     }
 
     /// Resolve an alias to its canonical principal name (aliases table is
     /// operator-managed; see schema.sql). On the exact-match hot path this
     /// is never called — only on a lookup miss.
     pub fn get_alias(&self, name: &str) -> Result<Option<String>, KdbError> {
-        self.read_with_fallback(
+        let got = self.read_with_fallback::<String>(
             "SELECT canonical FROM aliases WHERE alias = $1",
             name,
-        )
+        );
+        let Some(cache) = &self.offline else { return got };
+        match got {
+            Ok(Some(canonical)) => {
+                cache.note_alias(name, &canonical);
+                Ok(Some(canonical))
+            }
+            Ok(None) => Ok(None),
+            Err(_) => match cache.get_alias(name) {
+                Some(canonical) => Ok(Some(canonical)),
+                None => Err(offline_unavailable()),
+            },
+        }
     }
 
     pub fn put_principal(
@@ -668,6 +895,111 @@ mod tests {
             assert!(matches!(tls, Tls::Verified(_)));
             assert_eq!(uri, "postgresql://u@h/db?sslmode=require");
         }
+    }
+
+    /// A URI nothing is listening on: connects refuse instantly, so these
+    /// tests measure our retry/fallback logic and not a network timeout.
+    const DEAD_URI: &str = "postgresql://u@127.0.0.1:1/db?sslmode=disable";
+
+    #[test]
+    fn dead_database_still_fails_fast_by_default() {
+        // Regression guard on the default: no startup_retry_ms and no
+        // offline cache must behave exactly as it always has.
+        let t0 = Instant::now();
+        assert!(Store::connect(DEAD_URI).is_err());
+        assert!(t0.elapsed() < Duration::from_millis(500), "not fail-fast");
+    }
+
+    #[test]
+    fn startup_retry_spends_its_budget_then_gives_up() {
+        let t0 = Instant::now();
+        let r = Store::connect_opts(
+            DEAD_URI,
+            StoreOpts { startup_retry_ms: 900, ..StoreOpts::default() },
+        );
+        let spent = t0.elapsed();
+        assert!(r.is_err(), "an unreachable DB must not yield a Store");
+        // 250 + 500 = 750ms of backoff fits; the next (1000ms) does not.
+        assert!(spent >= Duration::from_millis(700), "gave up early: {spent:?}");
+        assert!(spent < Duration::from_millis(2500), "overran: {spent:?}");
+    }
+
+    #[test]
+    fn offline_cache_serves_a_cold_start_with_no_database() {
+        // The cold-start contract, without needing a database at all:
+        // a warm cache file + an unreachable CRDB must still produce a
+        // usable Store that answers from the cache and refuses — with
+        // SVC_UNAVAILABLE, never NoEntry — for anything it never saw.
+        let dir = std::env::temp_dir().join(format!(
+            "kdb-crdb-store-offline-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cache.bin");
+        let warm = OfflineCache::open(
+            path.to_str().unwrap(),
+            Duration::from_secs(600),
+        );
+        warm.note_entry("K/M@EXAMPLE.COM", b"master-blob");
+        warm.note_alias("alicia@EXAMPLE.COM", "alice@EXAMPLE.COM");
+        warm.flush_now();
+        drop(warm);
+
+        let store = Store::connect_opts(
+            DEAD_URI,
+            StoreOpts {
+                startup_retry_ms: 300,
+                offline: Some(OfflineCache::open(
+                    path.to_str().unwrap(),
+                    Duration::from_secs(600),
+                )),
+                ..StoreOpts::default()
+            },
+        )
+        .expect("offline cache must make a DB-less start survivable");
+
+        assert_eq!(
+            store.get_principal("K/M@EXAMPLE.COM").unwrap().as_deref(),
+            Some(&b"master-blob"[..]),
+            "cold start could not read the master key entry"
+        );
+        assert_eq!(
+            store.get_alias("alicia@EXAMPLE.COM").unwrap().as_deref(),
+            Some("alice@EXAMPLE.COM")
+        );
+        // The contract that keeps a partial cache from lying: an entry
+        // this KDC never read is unavailable, NOT missing.
+        let err = store.get_principal("bob@EXAMPLE.COM").unwrap_err();
+        assert!(is_unavailable(&err), "offline miss returned {err:?}");
+        assert!(
+            !matches!(err, KdbError::NoEntry),
+            "offline miss must never be NoEntry"
+        );
+        let err = store.get_alias("nobody@EXAMPLE.COM").unwrap_err();
+        assert!(is_unavailable(&err));
+
+        // Writes stay closed — no cache, no local buffering, no acks.
+        assert!(store.put_principal("bob@EXAMPLE.COM", b"x").is_err());
+        assert!(store.delete_principal("K/M@EXAMPLE.COM").is_err());
+        assert!(store.get_policy("default").is_err());
+
+        // And expired data is refused rather than served unbounded-stale.
+        let strict = Store::connect_opts(
+            DEAD_URI,
+            StoreOpts {
+                offline: Some(OfflineCache::open(
+                    path.to_str().unwrap(),
+                    Duration::from_millis(1),
+                )),
+                ..StoreOpts::default()
+            },
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(is_unavailable(
+            &strict.get_principal("K/M@EXAMPLE.COM").unwrap_err()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

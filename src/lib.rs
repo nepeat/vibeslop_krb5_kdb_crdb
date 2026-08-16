@@ -20,6 +20,7 @@
 //! - decrypt/encrypt_key_data: defaults (krb5_dbe_def_*) are correct.
 
 mod marshal;
+mod offline;
 mod store;
 
 use std::collections::HashMap;
@@ -31,7 +32,23 @@ use kurbu5_kdb_rs::{
     OpenMode, PolicyEntry, PrincipalEntry, PrincipalEntryRef, PrincipalRef,
     ServerType,
 };
-use store::Store;
+use offline::OfflineCache;
+use store::{Store, StoreOpts};
+
+/// Operational logging. The plugin has no logging channel of its own —
+/// libkdb5 gives modules no logger and krb5_klog is private to the
+/// daemons — so notices go to stderr with a fixed prefix, which krb5kdc
+/// and kadmind inherit (systemd/quadlet/k8s capture it as the unit's
+/// log). Deliberately NOT `eprintln!`: that panics if stderr is closed,
+/// and this crate must never unwind across the C vtable boundary.
+///
+/// Reserved for state changes an operator must be able to see after the
+/// fact (connect retries, running without a database, cache trouble) —
+/// never per-request chatter.
+pub(crate) fn warn(msg: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "kdb_crdb: {msg}");
+}
 
 /// Per-process TTL cache of principal wire blobs, KDC role only.
 ///
@@ -105,6 +122,33 @@ fn realm_of(name: &str) -> &str {
     at.map_or("", |i| &name[i + 1..])
 }
 
+/// Config lookup order for every knob: `-x key=value` on kadmin/kdb5_util
+/// first, then the `[dbmodules]` profile key.
+fn conf(
+    ctx: &KdbContext<'_>,
+    section: &str,
+    db_args: &[&str],
+    key: &str,
+) -> Option<String> {
+    let prefix = format!("{key}=");
+    db_args
+        .iter()
+        .find_map(|a| a.strip_prefix(&prefix).map(str::to_owned))
+        .or_else(|| ctx.db_module_string(section, key))
+}
+
+fn conf_ms(
+    ctx: &KdbContext<'_>,
+    section: &str,
+    db_args: &[&str],
+    key: &str,
+    default: u64,
+) -> Result<u64, KdbError> {
+    conf(ctx, section, db_args, key).map_or(Ok(default), |s| {
+        s.parse::<u64>().map_err(|_| KdbError::Custom(libc::EINVAL))
+    })
+}
+
 impl CrdbKdb {
     fn canonical_name(
         &self,
@@ -146,43 +190,67 @@ impl KdbModule for CrdbKdb {
             .or_else(|| std::env::var("KDB_CRDB_URI").ok())
             .ok_or(KdbError::Custom(libc::EINVAL))?;
 
+        let is_kdc = matches!(mode.server, ServerType::Kdc);
+
         // entry_cache_ms: TTL for the KDC-role read cache (see EntryCache).
         // 0 disables. Only the KDC ever caches: kadmind/kdb5_util do
         // read-modify-write cycles and must always see fresh rows.
-        let cache_ms = db_args
-            .iter()
-            .find_map(|a| a.strip_prefix("entry_cache_ms=").map(str::to_owned))
-            .or_else(|| ctx.db_module_string(conf_section, "entry_cache_ms"))
-            .map_or(Ok(1000), |s| {
-                s.parse::<u64>().map_err(|_| KdbError::Custom(libc::EINVAL))
-            })?;
-        let cache = (cache_ms > 0 && matches!(mode.server, ServerType::Kdc))
-            .then(
-            || EntryCache {
-                ttl: Duration::from_millis(cache_ms),
-                map: Mutex::new(HashMap::new()),
-            },
-        );
+        let cache_ms =
+            conf_ms(ctx, conf_section, db_args, "entry_cache_ms", 1000)?;
+        let cache = (cache_ms > 0 && is_kdc).then(|| EntryCache {
+            ttl: Duration::from_millis(cache_ms),
+            map: Mutex::new(HashMap::new()),
+        });
 
         // stale_reads_ms: max staleness for the degraded-read fallback
         // (0 = off, the default). KDC role only: kadmind/kdb5_util do
         // read-modify-write and must never act on stale rows; the KDC's
         // auth path is read-only, so bounded staleness there just means
         // "keep issuing tickets through a DB quorum outage".
-        let stale_ms = db_args
-            .iter()
-            .find_map(|a| a.strip_prefix("stale_reads_ms=").map(str::to_owned))
-            .or_else(|| ctx.db_module_string(conf_section, "stale_reads_ms"))
-            .map_or(Ok(0), |s| {
-                s.parse::<u64>().map_err(|_| KdbError::Custom(libc::EINVAL))
-            })?;
-        let stale_ms = if matches!(mode.server, ServerType::Kdc) {
-            stale_ms
-        } else {
-            0
+        let stale_ms =
+            conf_ms(ctx, conf_section, db_args, "stale_reads_ms", 0)?;
+        let stale_ms = if is_kdc { stale_ms } else { 0 };
+
+        // startup_retry_ms: budget for retrying the initial connection
+        // (0 = fail fast, the historic behaviour). Every role gets this:
+        // a kadmind or kdb5_util that starts a few seconds before the DB
+        // is reachable should wait, not die.
+        let startup_retry_ms =
+            conf_ms(ctx, conf_section, db_args, "startup_retry_ms", 0)?;
+
+        // offline_cache_path + offline_cache_max_age_ms: last-known-good
+        // entry cache for surviving a cold start during a DB outage.
+        // Both or neither — a path without an age bound would serve
+        // unbounded-stale principal data, and an age bound without a path
+        // is a typo the operator wants to hear about.
+        let offline_path = conf(ctx, conf_section, db_args, "offline_cache_path");
+        let offline_age =
+            conf(ctx, conf_section, db_args, "offline_cache_max_age_ms")
+                .map(|s| {
+                    s.parse::<u64>().map_err(|_| KdbError::Custom(libc::EINVAL))
+                })
+                .transpose()?;
+        let offline = match (offline_path, offline_age) {
+            (None, None) => None,
+            // A zero max age can never serve anything: also a config error.
+            (Some(_), Some(0)) | (Some(_), None) | (None, Some(_)) => {
+                return Err(KdbError::Custom(libc::EINVAL))
+            }
+            // KDC role ONLY. kadmind/kdb5_util read-modify-write and make
+            // authorization decisions; they must never see a blob that
+            // did not come from a live, quorate database.
+            (Some(path), Some(age_ms)) => is_kdc.then(|| {
+                OfflineCache::open(&path, Duration::from_millis(age_ms))
+            }),
         };
 
-        Ok(CrdbKdb { store: Store::connect_with(&uri, stale_ms)?, cache })
+        Ok(CrdbKdb {
+            store: Store::connect_opts(
+                &uri,
+                StoreOpts { stale_ms, startup_retry_ms, offline },
+            )?,
+            cache,
+        })
     }
 
     // -- database lifecycle --------------------------------------------------
@@ -255,11 +323,24 @@ impl KdbModule for CrdbKdb {
                 return Ok(Some(marshal::decode_entry(ctx, &blob)?));
             }
         }
-        if let Some(blob) = self.store.get_principal(&name)? {
-            if let Some(cache) = &self.cache {
-                cache.put(&name, &blob);
+        // `offline` tracks "the database was unreachable and the offline
+        // cache could not answer". While that is true, a miss anywhere in
+        // the chain below must NOT become Ok(None): the cache is partial
+        // by construction, and a false "principal does not exist" is a
+        // much worse answer than "service unavailable, try later".
+        let mut offline = false;
+        match self.store.get_principal(&name) {
+            Ok(Some(blob)) => {
+                if let Some(cache) = &self.cache {
+                    cache.put(&name, &blob);
+                }
+                return Ok(Some(marshal::decode_entry(ctx, &blob)?));
             }
-            return Ok(Some(marshal::decode_entry(ctx, &blob)?));
+            Ok(None) => {}
+            // Still worth trying the alias table: the offline cache keeps
+            // alias rows too, so an aliased principal stays resolvable.
+            Err(e) if store::is_unavailable(&e) => offline = true,
+            Err(e) => return Err(e),
         }
 
         // Miss: try the operator-managed aliases table. Per the kdb.h
@@ -268,18 +349,25 @@ impl KdbModule for CrdbKdb {
         // request whether canonicalization is acceptable). An alias whose
         // canonical name lives in ANOTHER realm is a referral, and those
         // may only be surfaced when the KDC set KRB5_KDB_FLAG_REFERRAL_OK.
-        let Some(canonical) = self.store.get_alias(&name)? else {
-            return Ok(None);
+        let miss = |offline: bool| {
+            if offline { Err(store::offline_unavailable()) } else { Ok(None) }
+        };
+        let canonical = match self.store.get_alias(&name) {
+            Ok(Some(c)) => c,
+            Ok(None) => return miss(offline),
+            Err(e) if store::is_unavailable(&e) => return miss(true),
+            Err(e) => return Err(e),
         };
         if realm_of(&canonical) != realm_of(&name)
             && !flags.contains(LookupFlags::REFERRAL_OK)
         {
             return Ok(None);
         }
-        match self.store.get_principal(&canonical)? {
-            Some(blob) => Ok(Some(marshal::decode_entry(ctx, &blob)?)),
+        match self.store.get_principal(&canonical) {
+            Ok(Some(blob)) => Ok(Some(marshal::decode_entry(ctx, &blob)?)),
             // Dangling alias row = the principal does not exist.
-            None => Ok(None),
+            Ok(None) => miss(offline),
+            Err(e) => Err(e),
         }
     }
 
