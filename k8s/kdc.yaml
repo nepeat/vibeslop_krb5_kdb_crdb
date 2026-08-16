@@ -90,7 +90,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: krb5kdc
-          image: hub.generalprogramming.org/erinpublic/kdc:e52f869
+          image: hub.generalprogramming.org/erinpublic/kdc:d778f25-amd64
           # Workers are DB-latency-bound, not CPU-bound: oversubscribe.
           command: ["krb5kdc", "-n", "-w", "48"]
           env:
@@ -148,7 +148,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: kadmind
-          image: hub.generalprogramming.org/erinpublic/kdc:e52f869
+          image: hub.generalprogramming.org/erinpublic/kdc:d778f25-amd64
           command: ["kadmind", "-nofork"]
           env:
             - {name: KRB5_CONFIG, value: /config/krb5.conf}

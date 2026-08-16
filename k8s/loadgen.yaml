@@ -16,7 +16,7 @@ spec:
     seccompProfile: {type: RuntimeDefault}
   containers:
     - name: loadgen
-      image: hub.generalprogramming.org/erinpublic/kdc:e52f869
+      image: hub.generalprogramming.org/erinpublic/kdc:d778f25-amd64
       command: ["/bin/sh", "-c", "sleep infinity"]
       env:
         - {name: KRB5_CONFIG, value: /config/krb5.conf}

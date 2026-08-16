@@ -796,3 +796,13 @@ Follow-ups recommended: switch Row::get → try_get (defense in depth);
 send specialize_salts note upstream with the kurbu5 patches (the trait
 docs don't mention the salt contract — anyone implementing rename hits
 bug #3); consider caching alias-resolved entries (perf only).
+
+## 2026-08-16: correctness fixes verified + deployed to sea1
+
+Independently verified the adversarial-pass fixes (cargo 21/21 rerun,
+diffs reviewed) and pushed d778f25. sea1 kdc/kadmind/loadgen rolled to
+erinpublic/kdc:d778f25-amd64; live renprinc-then-kinit check passes on
+the 262k realm (the pre-fix plugin would have bricked the password),
+and the kadmin safety suite is 28/28 post-upgrade. sea1 never ran
+renprinc before today, so no remediation needed. Multi-arch manifest
+for :d778f25/:latest lands when the qemu arm64 rebuild finishes.
