@@ -83,15 +83,26 @@ pub struct CrdbKdb {
 }
 
 /// Realm of an unparsed principal name: everything after the last
-/// unescaped '@'. krb5 escapes a literal '@' in components as "\@".
+/// unescaped '@'. krb5 quotes specials with a backslash and a literal
+/// backslash as "\\", so scan FORWARD tracking escape state — a reverse
+/// scan misreads "comp\\@R" (component ending in a literal backslash) as
+/// having an escaped separator.
 fn realm_of(name: &str) -> &str {
     let bytes = name.as_bytes();
-    for i in (0..bytes.len()).rev() {
-        if bytes[i] == b'@' && (i == 0 || bytes[i - 1] != b'\\') {
-            return &name[i + 1..];
+    let mut at = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2, // escape consumes the next char
+            b'@' => {
+                at = Some(i);
+                i += 1;
+            }
+            _ => i += 1,
         }
     }
-    ""
+    // '@' is ASCII, so at+1 is always a char boundary.
+    at.map_or("", |i| &name[i + 1..])
 }
 
 impl CrdbKdb {
@@ -397,3 +408,26 @@ impl KdbModule for CrdbKdb {
 // Exports the C symbol `kdb_function_table` that libkdb5 resolves after
 // dlopen()ing kdb_crdb.so from the plugin dir.
 kdb_plugin!(kdb_crdb, CrdbKdb);
+
+#[cfg(test)]
+mod tests {
+    use super::realm_of;
+
+    #[test]
+    fn realm_of_handles_krb5_quoting() {
+        // Plain names.
+        assert_eq!(realm_of("alice@EXAMPLE.COM"), "EXAMPLE.COM");
+        assert_eq!(realm_of("host/a.example.com@EXAMPLE.COM"), "EXAMPLE.COM");
+        assert_eq!(realm_of("norealm"), "");
+        assert_eq!(realm_of("empty@"), "");
+        // Escaped '@' inside a component is not the separator.
+        assert_eq!(realm_of(r"odd\@user@REALM"), "REALM");
+        assert_eq!(realm_of(r"odd\@user"), "");
+        // Component ending in a literal backslash: krb5 unparses it as
+        // "\\", so the separator is preceded by a backslash that does NOT
+        // escape it. A naive reverse scan misreads this.
+        assert_eq!(realm_of(r"trail\\@REALM"), "REALM");
+        // Escaped backslash then escaped '@', then the real separator.
+        assert_eq!(realm_of(r"a\\\@b@R"), "R");
+    }
+}
