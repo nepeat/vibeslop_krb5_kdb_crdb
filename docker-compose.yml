@@ -50,6 +50,12 @@ services:
           cockroach cert create-client krb5kdc --certs-dir=/certs --ca-key=/certs/ca.key
           chmod 644 client.krb5kdc.crt client.krb5kdc.key
         fi
+        # Receiver identity for kprop/iprop replica mode (own guard: predates
+        # some .certs dirs). Key world-readable for host tests — DEV ONLY.
+        if [[ ! -f client.krb5prop.crt ]]; then
+          cockroach cert create-client krb5prop --certs-dir=/certs --ca-key=/certs/ca.key
+          chmod 644 client.krb5prop.crt client.krb5prop.key
+        fi
         echo 'certs ready'
 
   roach-west:
@@ -100,7 +106,7 @@ services:
         done
         cockroach sql --certs-dir=/certs --host=roach-west:26257 --file=/schema.sql
         cockroach sql --certs-dir=/certs --host=roach-west:26257 \
-          -e "ALTER USER root WITH PASSWORD 'root-dev-pw'; ALTER USER krb5kdc WITH PASSWORD 'krb5kdc-dev-pw'"
+          -e "ALTER USER root WITH PASSWORD 'root-dev-pw'; ALTER USER krb5kdc WITH PASSWORD 'krb5kdc-dev-pw'; ALTER USER krb5prop WITH PASSWORD 'krb5prop-dev-pw'"
         echo 'schema applied'
 
 volumes:
