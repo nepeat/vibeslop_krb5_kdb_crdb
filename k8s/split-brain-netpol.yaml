@@ -1,0 +1,19 @@
+# Chaos: full CRDB split brain. Allows ingress to the CRDB pods ONLY
+# from Kerberos clients (kdc/kadmind/loadgen), which blocks all
+# node-to-node CRDB traffic — every node becomes an isolated minority
+# while staying reachable by the KDCs. Delete to heal.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: chaos-split-brain
+  namespace: tmp-crdb-krb5
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: cockroachdb
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - {key: app, operator: In, values: [kdc, kadmind, loadgen]}

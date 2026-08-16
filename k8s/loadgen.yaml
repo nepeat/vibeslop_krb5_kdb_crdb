@@ -1,0 +1,48 @@
+# Loader/bench pod: kadmin.local (direct-DB writes, no kadmind RPC) and
+# tgsbench live here. Long-running sleep; work is kubectl exec'd in so we
+# can iterate on rates without pod churn.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: loadgen
+  namespace: tmp-crdb-krb5
+  labels: {app: loadgen}
+spec:
+  imagePullSecrets:
+    - {name: regcred}
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile: {type: RuntimeDefault}
+  containers:
+    - name: loadgen
+      image: registry-tmp-crdb.owo.me/kdc:v3
+      command: ["/bin/sh", "-c", "sleep infinity"]
+      env:
+        - {name: KRB5_CONFIG, value: /config/krb5.conf}
+        - {name: KRB5_KDC_PROFILE, value: /config/kdc.conf}
+      resources:
+        requests: {cpu: "16", memory: 4Gi}
+        limits: {cpu: "48", memory: 8Gi}
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: {drop: ["ALL"]}
+      volumeMounts:
+        - {name: config, mountPath: /config, readOnly: true}
+        - {name: stash, mountPath: /secrets/stash, readOnly: true}
+        - {name: crdb-client, mountPath: /secrets/crdb, readOnly: true}
+        - {name: rundir, mountPath: /var/lib/krb5kdc}
+        - {name: tmp, mountPath: /tmp}
+  volumes:
+    - name: config
+      configMap: {name: kdc-config}
+    - name: stash
+      secret: {secretName: kdc-stash, defaultMode: 0400}
+    - name: crdb-client
+      secret: {secretName: kdc-crdb-client, defaultMode: 0400}
+    - name: rundir
+      emptyDir: {}
+    - name: tmp
+      emptyDir: {}

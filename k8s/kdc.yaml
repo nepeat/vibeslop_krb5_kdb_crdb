@@ -1,0 +1,203 @@
+# 3 KDCs on the kdb_crdb backend, one per sea1 metal node (required
+# anti-affinity), plus one kadmind. Image is the nix closure built by the
+# dev box (registry-tmp-crdb.owo.me/kdc). Unprivileged: KDC listens on
+# 8888, Service maps 88 -> 8888.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kdc-config
+  namespace: tmp-crdb-krb5
+data:
+  krb5.conf: |
+    [libdefaults]
+        default_realm = EXAMPLE.COM
+        dns_lookup_kdc = false
+    [realms]
+        EXAMPLE.COM = {
+            kdc = kdc.tmp-crdb-krb5.svc.cluster.local:88
+            admin_server = kadmind.tmp-crdb-krb5.svc.cluster.local:749
+        }
+  kdc.conf: |
+    [kdcdefaults]
+        kdc_ports = 8888
+        kdc_tcp_ports = 8888
+    [realms]
+        EXAMPLE.COM = {
+            database_module = crdb
+            acl_file = /config/kadm5.acl
+            key_stash_file = /secrets/stash/master.stash
+            kadmind_port = 8749
+            kpasswd_port = 8464
+            max_life = 10h 0m 0s
+            max_renewable_life = 7d 0h 0m 0s
+        }
+    [dbmodules]
+        db_module_dir = /opt/kdb
+        crdb = {
+            db_library = kdb_crdb
+            # All three CRDB pods by stable DNS (headless service names
+            # resolve regardless of readiness). The plugin rotates the
+            # host order per process and walks the list on reconnect, so
+            # gateway failover works even when quorum loss makes every
+            # node "unready" and empties the public Service.
+            connection_uri = postgresql://krb5kdc@crdb-cockroachdb-0.crdb-cockroachdb.tmp-crdb-krb5.svc.cluster.local:26257,crdb-cockroachdb-1.crdb-cockroachdb.tmp-crdb-krb5.svc.cluster.local:26257,crdb-cockroachdb-2.crdb-cockroachdb.tmp-crdb-krb5.svc.cluster.local:26257/krb5?sslmode=verify-full&sslrootcert=/secrets/crdb/ca.crt&sslcert=/secrets/crdb/client.krb5kdc.crt&sslkey=/secrets/crdb/client.krb5kdc.key&connect_timeout=3
+            disable_last_success = true
+            disable_lockout = true
+            entry_cache_ms = 1000
+            # Keep issuing tickets through CRDB quorum loss: KDC-role
+            # reads fall back to bounded-staleness follower reads.
+            stale_reads_ms = 30000
+        }
+    [logging]
+        kdc = STDERR
+        admin_server = STDERR
+        default = STDERR
+  kadm5.acl: |
+    admin/admin@EXAMPLE.COM *
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kdc
+  namespace: tmp-crdb-krb5
+spec:
+  replicas: 3
+  # No surge: a 4th pod can never schedule with required anti-affinity
+  # on a 3-node cluster; replace in place instead.
+  strategy:
+    rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+  selector:
+    matchLabels: {app: kdc}
+  template:
+    metadata:
+      labels: {app: kdc}
+    spec:
+      imagePullSecrets:
+        - {name: regcred}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: {app: kdc}
+              topologyKey: kubernetes.io/hostname
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: krb5kdc
+          image: registry-tmp-crdb.owo.me/kdc:v5
+          # Workers are DB-latency-bound, not CPU-bound: oversubscribe.
+          command: ["krb5kdc", "-n", "-w", "48"]
+          env:
+            - {name: KRB5_CONFIG, value: /config/krb5.conf}
+            - {name: KRB5_KDC_PROFILE, value: /config/kdc.conf}
+          ports:
+            - {containerPort: 8888, protocol: UDP, name: kdc-udp}
+            - {containerPort: 8888, protocol: TCP, name: kdc-tcp}
+          resources:
+            requests: {cpu: "8", memory: 2Gi}
+            limits: {cpu: "24", memory: 4Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          readinessProbe:
+            tcpSocket: {port: 8888}
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - {name: config, mountPath: /config, readOnly: true}
+            - {name: stash, mountPath: /secrets/stash, readOnly: true}
+            - {name: crdb-client, mountPath: /secrets/crdb, readOnly: true}
+            - {name: rundir, mountPath: /var/lib/krb5kdc}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: config
+          configMap: {name: kdc-config}
+        - name: stash
+          secret: {secretName: kdc-stash, defaultMode: 0400}
+        - name: crdb-client
+          secret: {secretName: kdc-crdb-client, defaultMode: 0400}
+        - name: rundir
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kadmind
+  namespace: tmp-crdb-krb5
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: kadmind}
+  template:
+    metadata:
+      labels: {app: kadmind}
+    spec:
+      imagePullSecrets:
+        - {name: regcred}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: kadmind
+          image: registry-tmp-crdb.owo.me/kdc:v5
+          command: ["kadmind", "-nofork"]
+          env:
+            - {name: KRB5_CONFIG, value: /config/krb5.conf}
+            - {name: KRB5_KDC_PROFILE, value: /config/kdc.conf}
+          ports:
+            - {containerPort: 8749, protocol: TCP, name: kadmin}
+            - {containerPort: 8464, protocol: UDP, name: kpasswd}
+          resources:
+            requests: {cpu: "1", memory: 512Mi}
+            limits: {cpu: "4", memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: config, mountPath: /config, readOnly: true}
+            - {name: stash, mountPath: /secrets/stash, readOnly: true}
+            - {name: crdb-client, mountPath: /secrets/crdb, readOnly: true}
+            - {name: rundir, mountPath: /var/lib/krb5kdc}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: config
+          configMap: {name: kdc-config}
+        - name: stash
+          secret: {secretName: kdc-stash, defaultMode: 0400}
+        - name: crdb-client
+          secret: {secretName: kdc-crdb-client, defaultMode: 0400}
+        - name: rundir
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kdc
+  namespace: tmp-crdb-krb5
+spec:
+  selector: {app: kdc}
+  ports:
+    - {name: kdc-udp, port: 88, targetPort: 8888, protocol: UDP}
+    - {name: kdc-tcp, port: 88, targetPort: 8888, protocol: TCP}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kadmind
+  namespace: tmp-crdb-krb5
+spec:
+  selector: {app: kadmind}
+  ports:
+    - {name: kadmin, port: 749, targetPort: 8749, protocol: TCP}
+    - {name: kpasswd, port: 464, targetPort: 8464, protocol: UDP}

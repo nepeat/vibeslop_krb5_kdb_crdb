@@ -1,0 +1,28 @@
+# CockroachDB Helm values for the tmp-crdb-krb5 scale test on sea1.
+# 3 nodes, one per metal host (chart's default anti-affinity), TLS via the
+# chart's self-signer, data on local-path (node NVMe at /var/mnt/data).
+# Single-region locality so schema.sql's multi-region DDL (PRIMARY REGION /
+# LOCALITY GLOBAL) works with region=sea1.
+statefulset:
+  replicas: 3
+  podManagementPolicy: Parallel
+  resources:
+    requests:
+      cpu: "8"
+      memory: 32Gi
+    limits:
+      cpu: "24"
+      memory: 32Gi
+
+conf:
+  cache: 8Gi
+  max-sql-memory: 8Gi
+  locality: region=sea1
+
+storage:
+  persistentVolume:
+    storageClass: local-path
+    size: 200Gi
+
+tls:
+  enabled: true
