@@ -35,6 +35,11 @@
         # quorum loss, so reads stop being satisfiable ~this long after it
         # and auth fails closed (e2e/staleness-bound.sh measures both).
         stale_reads_ms = 30000
+        # Cold-start resilience is deliberately NOT enabled here: the
+        # stale-read suites must keep measuring the stale path alone.
+        # e2e/cold-start.sh splices startup_retry_ms + offline_cache_path
+        # + offline_cache_max_age_ms into a copy of this file and proves
+        # a krb5kdc RESTART survives all three CRDB nodes being down.
     }
 
 [logging]

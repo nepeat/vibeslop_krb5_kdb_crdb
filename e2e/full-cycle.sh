@@ -15,6 +15,9 @@
 #                              partition: which kvno each side issues.
 #                              Needs passwordless sudo for netns iptables;
 #                              SKIPPED loudly if unavailable)
+#   8. e2e/cold-start.sh      (krb5kdc RESTARTED while all three CRDB
+#                              nodes are down: startup_retry_ms + the
+#                              offline last-known-good cache)
 #
 # Not in the cycle — measurement suites, run them when the numbers matter
 # (they are slow and their output belongs in docs/progress.md):
@@ -69,5 +72,8 @@ if sudo -n true 2>/dev/null; then
 else
     say "SKIPPED e2e/kvno-partition.sh — needs passwordless sudo (nsenter/iptables)"
 fi
+
+say "cold start: KDC restarted with every CRDB node down"
+e2e/cold-start.sh
 
 say "FULL CYCLE PASS"
