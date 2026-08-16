@@ -806,3 +806,158 @@ the 262k realm (the pre-fix plugin would have bricked the password),
 and the kadmin safety suite is 28/28 post-upgrade. sea1 never ran
 renprinc before today, so no remediation needed. Multi-arch manifest
 for :d778f25/:latest lands when the qemu arm64 rebuild finishes.
+
+## 2026-08-16: five failure-testing gaps closed (external review) — kvno
+## across a partition, region death, staleness bound, convergence, worker curve
+
+External review found five holes in the chaos coverage. Each now has a
+script with assertions plus recorded numbers, all on the compose cluster
+(3 secure CRDB nodes, one per region, freshly recreated; e2e realm with
+1024 users + 1024 hosts from run.sh).
+
+**New partition primitive** (reusable): iptables INSIDE the container's
+network namespace — `sudo nsenter -t <container pid> -n iptables -I INPUT
+-s <peer ip> -j DROP` (+ OUTPUT). This box has no br_netfilter, so
+DOCKER-USER/FORWARD rules never see container<->container traffic and
+"partitions" applied there silently do nothing (verified). Cutting inside
+the netns does enforce, and it leaves published host ports alone — which
+is exactly what lets a KDC keep talking to a CRDB node its peers cannot
+reach. Enforcement is confirmed by polling a real peer dial, never by
+sleeping (the k8s suite's lesson, same convention).
+
+### G1 — key rotation across a partition (`e2e/kvno-partition.sh`)
+roach-eu isolated from west+east. KDC-majority (gateway roach-west, port
+10088) and KDC-minority (gateway roach-eu, port 11088), both `-w 1` so one
+worker == one cache == one breaker == one connection. `ktadd` through the
+majority while partitioned:
+
+| measurement | value |
+|---|---|
+| write (ktadd) with quorum present | 0.13 s |
+| majority serves the NEW kvno after | 0.86 s (bound = entry_cache_ms 1000) |
+| minority over a 20 s window, 7 samples | kvno=OLD every time, 0 failures, 0 wrong |
+| observed DATA staleness on the minority | 18.12 s (bound = stale_reads_ms 30 s) |
+| minority convergence after heal | 2.53 s (1.26 s in an earlier run) |
+
+Not just the kvno label — the key material is checked cryptographically:
+`kinit -kt` with the OLD keytab succeeds against the minority KDC and
+FAILS against the majority; the NEW keytab is the mirror image.
+**VERDICT: MATCHES.** Majority promptly new, minority only ever the old
+value, converges after heal.
+
+### G2 — region death (`e2e/region-death.sh`)
+First, what the cluster actually is rather than what the DDL asked for:
+`SHOW SURVIVAL GOAL` = region, and the derived zone config wants
+num_replicas/num_voters = 5 with `voter_constraints {+region=us-west2: 2}`
+— but five voters cannot be placed on three stores, so **every range runs
+3 voters, quorum 2**. With one node per region, region == node, so
+**SURVIVE REGION FAILURE is not expressible on this topology**; a real
+test needs >= 3 nodes per region (9 total) so voters can sit 2/2/1 and a
+whole region can go without dropping below quorum (terraform/aws +
+ansible already build that shape). The suite prints the applied config and
+the real replica counts instead of assuming them.
+
+What this topology *can* express is proved, with **stale_reads_ms = 0** so
+any dependence on the degraded fallback would show up as an outright auth
+failure:
+
+| case | auth (kinit+kvno) | TGS/s | write |
+|---|---|---|---|
+| baseline, 3/3, west gateway | 0.07 s | 3204 | 0.17 s |
+| europe-west4 dead | 0.06 s | 3101 | 0.18 s |
+| baseline, 3/3, east gateway | 0.06 s | — | 0.17 s |
+| us-west2 dead (PRIMARY + lease preference) | 0.08 s | 3321 | 0.15 s |
+
+**VERDICT: MATCHES** the "one region dead -> transparent" row (auth AND
+writes unaffected, no stale reads needed, latency flat), with the caveat
+above that here that means one node of three.
+
+### G3 — the staleness bound (`e2e/staleness-bound.sh`)
+One KDC `-w 1` on roach-west; east+eu stopped (quorum GONE). An auth
+sampler kinits a canary every second; a SQL sampler — one psql session
+opened BEFORE the partition, because a NEW connection to a quorum-less
+node cannot even authenticate — issues exactly the plugin's bounded-stale
+read once a second.
+
+| stale_reads_ms | last stale read served | KDC auth last ok | first auth fail |
+|---:|---|---|---|
+| 30000 | t+31.6 s | t+30.9 s | t+33.5 s |
+| 10000 | t+10.6 s | t+10.5 s | t+13.1 s |
+
+CockroachDB spells the mechanism out in its refusal: *"minimum timestamp
+bound of <now - stale_reads_ms> could not be satisfied by a local resolved
+timestamp of <T>"* — where T is frozen at quorum loss (measured t+1.71 s
+and t+0.82 s in the two runs). So **the survival window IS stale_reads_ms**
+(the 10 s control proves it isn't some CRDB lease timer), and nothing older
+than the bound is ever served: CRDB refuses instead, and auth fails closed.
+Worst auth latency while degraded: 1.55 s spikes on a ~6.5 s cycle
+(DEGRADED_HOLD_MS 5 s + the 1.5 s statement_timeout the re-probe eats).
+
+**VERDICT: MATCHES the letter, DEVIATES from the natural reading of the
+README.** "Keeps issuing tickets through node loss and even a full split
+brain, at most this many ms stale" reads as indefinite availability; it is
+actually bounded to ~stale_reads_ms. README + e2e/kdc.conf.in now say so
+("this is also the outage budget"), with the measured numbers.
+
+Measurement trap worth remembering: under `with_max_staleness`, SQL
+`now()` reports the UPPER bound of the negotiation, not the timestamp the
+KV layer settled on (a fixed `AS OF SYSTEM TIME '-10s'` DOES move now()
+back 10 s — verified both ways). Timestamp-based staleness numbers from
+that query are therefore meaningless; the bound is proven by the refusal
+above and by G1's data-level observation.
+
+### G4 — heal -> fresh convergence
+Expected bound from the code: DEGRADED_HOLD_MS (5 s breaker) +
+entry_cache_ms (1 s). Measured: **2.53 s / 1.26 s** for a write made
+during a partition to become visible on the healed minority KDC (G1), and
+**0.09 s** for a write made after quorum returns (G3; writes themselves
+recovered 2.5-6.1 s after the containers came back). The breaker does not
+cost the full 5 s in practice because bounded-staleness reads pick the
+NEWEST servable timestamp — once the cluster recovers, the "stale" path is
+already fresh, so only the entry cache lags. **VERDICT: MATCHES, well
+inside the bound.**
+
+### G5 — worker scaling curve (`e2e/worker-scaling.sh`)
+128 client threads (tgsbench), 1024-host set, standard kdc.conf, err=0
+everywhere. Sessions sampled UNDER load from
+`crdb_internal.cluster_sessions`:
+
+| -w | TGS/s | per worker | krb5kdc SQL sessions | krb5kdc procs |
+|---:|------:|-----------:|---------------------:|--------------:|
+|  1 |   726 |        726 |  1 |  2 |
+|  2 |  1591 |        795 |  2 |  3 |
+|  4 |  3837 |        959 |  4 |  5 |
+|  8 |  8937 |       1117 |  8 |  9 |
+| 16 |  8933 |        558 | 16 | 17 |
+| 32 |  7176 |        224 | 32 | 33 |
+
+**Knee at 8 workers** on this 16-core box (which is also hosting the whole
+3-node CRDB cluster and the load generator); 16 is flat, 32 regresses ~20%.
+Connection accounting is exact: **sessions == workers** for workers+1
+processes, i.e. the supervisor's pre-fork handle is not a live session and
+each worker really does hold its own synchronous connection. A repeat run
+gave 325/1594/3742/7011/9311/7128 — same shape, w=1 and w=16 are the noisy
+points (a low-thread control put single-worker capacity at ~800/s, so the
+325 was client-side queueing, not the plugin).
+
+### Wiring
+`e2e/full-cycle.sh` gains step 6 (region-death.sh) and step 7
+(kvno-partition.sh, skipped LOUDLY when passwordless sudo is unavailable
+since it needs nsenter). staleness-bound.sh and worker-scaling.sh are
+deliberately NOT in the cycle — they are multi-minute measurement suites
+whose output belongs here.
+
+### Other findings (no code changed)
+- **A new connection to a quorum-less node cannot authenticate at all**:
+  `operation "get-user-session" timed out ... internal error while
+  retrieving user account`. Existing sessions keep working, so the
+  plugin's long-lived connection survives an outage but a reconnect
+  during one will not — which is the real reason multi-host
+  connection_uri exists. Worth keeping in mind for restart-during-outage
+  runbooks.
+- While degraded, every KDC worker pays a ~1.5 s stall every ~6.5 s (the
+  breaker re-probe hitting statement_timeout). Fine at -w 16 (spread
+  across workers) but visible as p99 during an outage.
+- Once the staleness bound lapses, the surviving node's SQL layer starts
+  failing everything with `replica unavailable ... r33:/NamespaceTable`
+  — not just the principals range; the whole session becomes useless.
