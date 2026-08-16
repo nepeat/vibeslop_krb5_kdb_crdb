@@ -1108,3 +1108,36 @@ proven bounded <=TTL+slack on every KDC (safety suite phase 3), and a
 1s window is noise against 10h ticket lifetimes — revocation latency
 is dominated by tickets, not this cache. Not removing it; 0 remains a
 supported per-deployment knob.
+
+## 2026-08-16: kprop-replica Phase 0 spike — MIT 1.22.2 load mechanics verified
+
+Instrumented open/create/put/promote_db (env-gated spike build, reverted
+after) and ran real kdb5_util against throwaway spike DBs (krb5spike1/2,
+plain tables, root). Ground truth, all against krb5 1.22.2:
+
+- **Plain `load`**: ONE process does `create(args=[<-x args...>,
+  "temporary"])` → put_principal per record (per-put db_args EMPTY) →
+  put_policy per policy → `promote_db(args=[..., "temporary"])`. libkdb5
+  calls create, not open (our create delegates to open — single choke
+  point holds). ServerType::Admin, ReadWrite.
+- **`load -update`**: open() WITHOUT temporary, plain upserts. Unchanged.
+- **`load -i`** (iprop_enable=true): identical shape to plain load but
+  db_args gain **"merge_nra"** (merge non-replicated attrs; we have
+  none — lockout/last-auth off by design — so it's accept-and-ignore).
+  The replica ulog (2MB, auto-created by ulog_map at the profile's
+  iprop_logfile path) is maintained CLIENT-side by kdb5_util/kpropd;
+  no backend hooks involved.
+- **iprop_enable=false** refuses dump -i/load -i client-side ("Iprop
+  not enabled") before touching the backend.
+- **`dump -i` FROM kdb-crdb works** (header `iprop 1 <sno> <ts>`) once
+  iprop_enable=true — the backend can even be an iprop dump source.
+- **kurbu5 promote_db is STATIC** (no &self, like create/destroy):
+  promote must re-open its own Store from conf_section+db_args (dburl
+  is present in promote's db_args). Same pid across create→puts→promote,
+  so a hostname:pid lease holder id is re-derivable at promote time.
+
+Design consequences locked in: gate enforcement stays in open() (create
+delegates); staging routing keys off the `temporary` db_arg; merge_nra
+accepted as no-op; promote_db re-opens, re-verifies marker+lease, then
+batched diff-promotes. Implementation next (schema → store/lib → tests
+→ e2e rig with a db2 primary).
