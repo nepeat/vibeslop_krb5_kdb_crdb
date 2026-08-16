@@ -1,0 +1,28 @@
+# {{ ansible_managed }}
+[Unit]
+Description=CockroachDB node ({{ crdb_region }}/{{ crdb_zone }})
+Requires=network-online.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=notify
+User={{ crdb_user }}
+ExecStart=/usr/local/bin/cockroach start \
+  --certs-dir={{ crdb_certs_dir }} \
+  --store=path={{ crdb_store_dir }} \
+  --listen-addr=:{{ crdb_sql_port }} \
+  --http-addr=:{{ crdb_http_port }} \
+  --advertise-addr={{ crdb_advertise }}:{{ crdb_sql_port }} \
+  --join={{ crdb_join_list }} \
+  --locality=region={{ crdb_region }},zone={{ crdb_zone }} \
+  --cache={{ crdb_cache }} \
+  --max-sql-memory={{ crdb_max_sql_memory }}
+Restart=always
+RestartSec=5
+# Graceful drain on stop; must exceed server.shutdown lease transfer time.
+TimeoutStopSec=300
+LimitNOFILE=65536
+NotifyAccess=all
+
+[Install]
+WantedBy=multi-user.target

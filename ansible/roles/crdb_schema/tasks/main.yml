@@ -1,0 +1,41 @@
+# Render the multi-region schema from inventory regions and apply it.
+# Runs on one host. Idempotent (IF NOT EXISTS everywhere).
+---
+- name: Derive region list from inventory
+  ansible.builtin.set_fact:
+    _regions: >-
+      {{ groups['crdb'] | map('extract', hostvars, 'crdb_region')
+         | unique | list }}
+
+- name: Pick primary region
+  ansible.builtin.set_fact:
+    _primary: "{{ crdb_primary_region if crdb_primary_region else _regions[0] }}"
+
+- name: Render schema
+  ansible.builtin.template:
+    src: schema.sql.j2
+    dest: /tmp/krb5-schema.sql
+    mode: "0644"
+
+- name: Apply schema
+  ansible.builtin.command:
+    cmd: >
+      /usr/local/bin/cockroach sql
+      --certs-dir={{ crdb_certs_dir }}
+      --host={{ crdb_advertise }}:{{ crdb_sql_port }}
+      --file=/tmp/krb5-schema.sql
+  register: _apply
+  changed_when: true
+
+- name: Verify regions match inventory
+  ansible.builtin.command:
+    cmd: >
+      /usr/local/bin/cockroach sql
+      --certs-dir={{ crdb_certs_dir }}
+      --host={{ crdb_advertise }}:{{ crdb_sql_port }}
+      --format=csv
+      -e "SELECT region FROM [SHOW REGIONS FROM DATABASE {{ crdb_krb5_database }}]"
+  register: _shown
+  changed_when: false
+  failed_when: >-
+    _regions | difference(_shown.stdout_lines[1:]) | length > 0

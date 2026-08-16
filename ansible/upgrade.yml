@@ -1,0 +1,43 @@
+# Rolling upgrade / restart: one node at a time, drain first, wait for
+# full replication before touching the next node.
+#
+#   ansible-playbook -i inventory/<env>/hosts.ini upgrade.yml \
+#       -e crdb_version=25.2.3
+---
+- name: Rolling upgrade
+  hosts: crdb
+  become: true
+  serial: 1
+  tasks:
+    - name: Drain node (transfers leases away)
+      ansible.builtin.command:
+        cmd: >
+          /usr/local/bin/cockroach node drain
+          --certs-dir={{ crdb_certs_dir }}
+          --host={{ crdb_advertise }}:{{ crdb_sql_port }}
+          --drain-wait=5m
+          --self
+      changed_when: true
+
+    - name: Apply node role (new binary if crdb_version changed)
+      ansible.builtin.include_role:
+        name: crdb_node
+
+    - name: Restart cockroach
+      ansible.builtin.systemd:
+        name: cockroach
+        state: restarted
+
+    - name: Wait until every range is fully replicated again
+      ansible.builtin.command:
+        cmd: >
+          /usr/local/bin/cockroach sql
+          --certs-dir={{ crdb_certs_dir }}
+          --host={{ crdb_advertise }}:{{ crdb_sql_port }}
+          --format=csv
+          -e "SELECT sum((metrics->>'ranges.underreplicated')::DECIMAL)::INT FROM crdb_internal.kv_store_status"
+      register: _under
+      retries: 60
+      delay: 10
+      until: _under.stdout_lines | last in ['0', 'NULL']
+      changed_when: false

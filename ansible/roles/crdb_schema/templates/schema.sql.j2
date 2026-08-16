@@ -1,0 +1,39 @@
+-- {{ ansible_managed }}
+-- Multi-region krb5 schema, generated from the Ansible inventory:
+-- regions = unique crdb_region hostvars, primary = {{ _primary }}.
+-- Mirrors ../../schema.sql (see repo root for design rationale).
+-- Idempotent: adding a region to the inventory + re-running the play
+-- emits a new ADD REGION and the tables follow automatically (GLOBAL).
+
+CREATE DATABASE IF NOT EXISTS {{ crdb_krb5_database }}
+    PRIMARY REGION "{{ _primary }}";
+
+{% for r in _regions if r != _primary -%}
+ALTER DATABASE {{ crdb_krb5_database }} ADD REGION IF NOT EXISTS "{{ r }}";
+{% endfor -%}
+{% if _regions | length >= 3 -%}
+ALTER DATABASE {{ crdb_krb5_database }} SURVIVE REGION FAILURE;
+{% endif %}
+USE {{ crdb_krb5_database }};
+
+CREATE TABLE IF NOT EXISTS principals (
+    name        STRING      NOT NULL PRIMARY KEY,
+    entry       BYTES       NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+) LOCALITY GLOBAL;
+
+CREATE TABLE IF NOT EXISTS policies (
+    name        STRING      NOT NULL PRIMARY KEY,
+    entry       BYTES       NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+) LOCALITY GLOBAL;
+
+CREATE TABLE IF NOT EXISTS aliases (
+    alias       STRING      NOT NULL PRIMARY KEY,
+    canonical   STRING      NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+) LOCALITY GLOBAL;
+
+CREATE USER IF NOT EXISTS {{ crdb_krb5_user }};
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE principals, policies TO {{ crdb_krb5_user }};
+GRANT SELECT ON TABLE aliases TO {{ crdb_krb5_user }};

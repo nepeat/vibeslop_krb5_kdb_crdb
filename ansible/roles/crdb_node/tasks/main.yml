@@ -1,0 +1,85 @@
+# Install cockroach, its certs, and a systemd unit on one node.
+---
+- name: Preflight — chrony/ntp active (CRDB kills skewed nodes)
+  ansible.builtin.command: timedatectl show -p NTPSynchronized --value
+  register: _ntp
+  changed_when: false
+  failed_when: _ntp.stdout.strip() != 'yes'
+
+- name: Create cockroach system user
+  ansible.builtin.user:
+    name: "{{ crdb_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    home: "{{ crdb_store_dir }}"
+    create_home: false
+
+- name: Create store + cert dirs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ crdb_user }}"
+    group: "{{ crdb_user }}"
+    mode: "0700"
+  loop:
+    - "{{ crdb_store_dir }}"
+    - "{{ crdb_certs_dir }}"
+
+- name: Fetch cockroach tarball
+  ansible.builtin.get_url:
+    url: "https://binaries.cockroachdb.com/cockroach-v{{ crdb_version }}.{{ crdb_arch }}.tgz"
+    dest: "/tmp/cockroach-v{{ crdb_version }}.tgz"
+    checksum: "{{ ('sha256:' + crdb_checksum) if crdb_checksum else omit }}"
+    mode: "0644"
+
+- name: Unpack cockroach
+  ansible.builtin.unarchive:
+    src: "/tmp/cockroach-v{{ crdb_version }}.tgz"
+    dest: /tmp
+    remote_src: true
+    creates: "/tmp/cockroach-v{{ crdb_version }}.{{ crdb_arch }}/cockroach"
+
+- name: Install cockroach binary (versioned + symlink)
+  ansible.builtin.copy:
+    src: "/tmp/cockroach-v{{ crdb_version }}.{{ crdb_arch }}/cockroach"
+    dest: "/usr/local/bin/cockroach-v{{ crdb_version }}"
+    remote_src: true
+    mode: "0755"
+
+- name: Point /usr/local/bin/cockroach at the pinned version
+  ansible.builtin.file:
+    src: "/usr/local/bin/cockroach-v{{ crdb_version }}"
+    dest: /usr/local/bin/cockroach
+    state: link
+
+- name: Install CA + this node's certs + root client cert
+  ansible.builtin.copy:
+    src: "{{ crdb_local_secrets }}/{{ item.src }}"
+    dest: "{{ crdb_certs_dir }}/{{ item.dest }}"
+    owner: "{{ crdb_user }}"
+    group: "{{ crdb_user }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - {src: "ca.crt", dest: "ca.crt", mode: "0644"}
+    - {src: "{{ inventory_hostname }}.node.crt", dest: "node.crt", mode: "0600"}
+    - {src: "{{ inventory_hostname }}.node.key", dest: "node.key", mode: "0600"}
+    - {src: "client.root.crt", dest: "client.root.crt", mode: "0600"}
+    - {src: "client.root.key", dest: "client.root.key", mode: "0600"}
+
+# Deliberately NO restart notify anywhere in this role: an inventory
+# change re-templates the unit (join list) on every node, and a
+# parallel restart would take the whole cluster down. Binary/unit/cert
+# changes are picked up by upgrade.yml (serial drain -> restart);
+# running nodes learn topology via gossip regardless.
+- name: Install systemd unit
+  ansible.builtin.template:
+    src: cockroach.service.j2
+    dest: /etc/systemd/system/cockroach.service
+    mode: "0644"
+
+- name: Enable + start cockroach
+  ansible.builtin.systemd:
+    name: cockroach
+    enabled: true
+    state: started
+    daemon_reload: true

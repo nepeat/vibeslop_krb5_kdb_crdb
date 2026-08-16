@@ -1,0 +1,29 @@
+# Tunables for the crdb group. Everything topology-shaped is derived
+# from the inventory, not set here.
+
+crdb_version: "25.2.2"
+crdb_arch: "linux-amd64"        # NODE arch (linux-arm64 for Graviton)
+crdb_local_arch: "linux-amd64"  # CONTROLLER arch (cert generation runs here)
+crdb_checksum: ""            # optional sha256 for the tarball; "" = skip
+
+crdb_user: cockroach
+crdb_store_dir: /var/lib/cockroach   # point at the local NVMe mount
+crdb_certs_dir: /etc/cockroach/certs
+crdb_sql_port: 26257
+crdb_http_port: 8080
+crdb_cache: 8GiB
+crdb_max_sql_memory: 8GiB
+
+# The realm database + least-privilege user, mirroring schema.sql.
+crdb_krb5_database: krb5
+crdb_krb5_user: krb5kdc
+
+# Which region becomes PRIMARY REGION in the generated DDL. Empty =
+# first region in inventory order.
+crdb_primary_region: ""
+
+# Where the controller keeps the CA and generated certs. Treat like a
+# password vault: the CA key mints certs for the whole cluster.
+crdb_local_secrets: "{{ playbook_dir }}/secrets"
+# Controller-side scratch dir for the pinned cockroach binary.
+crdb_local_cache: "{{ playbook_dir }}/.cache"

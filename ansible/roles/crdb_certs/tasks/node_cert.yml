@@ -1,0 +1,23 @@
+# Create one host's node cert and immediately stash it under a
+# per-host filename (create-node always emits node.crt/node.key).
+---
+- name: "Create node cert for {{ crdb_cert_host }}"
+  ansible.builtin.command:
+    cmd: >
+      {{ crdb_local_bin }} cert create-node
+      {{ crdb_cert_host }}
+      {{ hostvars[crdb_cert_host].crdb_advertise
+         | default(hostvars[crdb_cert_host].ansible_host) }}
+      localhost 127.0.0.1
+      --certs-dir={{ crdb_local_secrets }}
+      --ca-key={{ crdb_local_secrets }}/ca.key
+      --overwrite
+    creates: "{{ crdb_local_secrets }}/{{ crdb_cert_host }}.node.crt"
+
+- name: "Stash node cert files for {{ crdb_cert_host }}"
+  ansible.builtin.command:
+    cmd: >
+      mv {{ crdb_local_secrets }}/node.{{ item }}
+         {{ crdb_local_secrets }}/{{ crdb_cert_host }}.node.{{ item }}
+    removes: "{{ crdb_local_secrets }}/node.{{ item }}"
+  loop: [crt, key]

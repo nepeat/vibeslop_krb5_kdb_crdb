@@ -1,0 +1,19 @@
+---
+# Advertised address defaults to the inventory connection address.
+crdb_advertise: "{{ ansible_host }}"
+
+# Cross-region join list: up to two seed addresses per region, derived
+# from the inventory. Every region contributes seeds so no single
+# region's loss empties the list. Uses addresses, not names, so joining
+# needs no cross-region DNS.
+crdb_join_list: >-
+  {%- set seeds = [] -%}
+  {%- for region, hosts in groups['crdb'] | map('extract', hostvars)
+        | groupby('crdb_region') -%}
+    {%- for h in hosts[:2] -%}
+      {%- set _ = seeds.append(
+            (h.crdb_advertise | default(h.ansible_host))
+            ~ ':' ~ crdb_sql_port) -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {{ seeds | join(',') }}

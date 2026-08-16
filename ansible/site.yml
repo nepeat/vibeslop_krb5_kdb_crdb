@@ -1,0 +1,77 @@
+# Deploy + cluster a multi-region CockroachDB for the krb5 KDB backend.
+#
+#   ansible-playbook -i inventory/<env>/hosts.ini site.yml
+#
+# Region topology comes from inventory hostvars (crdb_region/crdb_zone).
+# Preconditions (checked where cheap, not provisioned here):
+#   - routable :26257/:8080 between all nodes across regions
+#   - time sync (chrony/ntp) — asserted per node
+---
+- name: Certificates (controller-local CA + node/client certs)
+  hosts: crdb
+  gather_facts: false
+  tags: [certs]
+  tasks:
+    # Runs ON the controller (delegate) but WITH crdb group vars in
+    # scope — avoids duplicating group_vars for localhost.
+    - name: Generate CA + certs on the controller
+      ansible.builtin.include_role:
+        name: crdb_certs
+        apply:
+          delegate_to: localhost
+          become: false
+      run_once: true
+
+- name: Install + start CRDB nodes
+  hosts: crdb
+  become: true
+  tags: [nodes]
+  roles:
+    - crdb_node
+
+- name: Bootstrap cluster (init + liveness)
+  hosts: "{{ groups['crdb'][0] }}"
+  become: true
+  tags: [init]
+  roles:
+    - crdb_init
+
+- name: krb5 schema (regions derived from inventory)
+  hosts: "{{ groups['crdb'][0] }}"
+  become: true
+  tags: [schema]
+  roles:
+    - crdb_schema
+
+- name: Cluster health report
+  hosts: "{{ groups['crdb'][0] }}"
+  become: true
+  gather_facts: false
+  tags: [verify]
+  tasks:
+    - name: Node status
+      ansible.builtin.command:
+        cmd: >
+          /usr/local/bin/cockroach node status
+          --certs-dir={{ crdb_certs_dir }}
+          --host={{ crdb_advertise }}:{{ crdb_sql_port }}
+      register: _status
+      changed_when: false
+
+    - name: No under-replicated ranges
+      ansible.builtin.command:
+        cmd: >
+          /usr/local/bin/cockroach sql
+          --certs-dir={{ crdb_certs_dir }}
+          --host={{ crdb_advertise }}:{{ crdb_sql_port }}
+          --format=csv
+          -e "SELECT sum((metrics->>'ranges.underreplicated')::DECIMAL)::INT FROM crdb_internal.kv_store_status"
+      register: _under
+      retries: 30
+      delay: 10
+      until: _under.stdout_lines | last in ['0', 'NULL']
+      changed_when: false
+
+    - name: Show summary
+      ansible.builtin.debug:
+        msg: "{{ _status.stdout_lines }}"

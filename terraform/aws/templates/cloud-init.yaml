@@ -1,0 +1,20 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+
+packages:
+  - chrony            # CRDB kills clock-skewed nodes; site.yml asserts sync
+  - containerd        # host container runtime (KDC containers, benches)
+  - python3           # ansible target dependency
+  - ca-certificates
+  - curl
+  - jq
+  - psmisc
+
+runcmd:
+  - systemctl enable --now chrony
+  - systemctl enable --now containerd
+  - sysctl -w vm.swappiness=1
+  - sysctl -w net.core.somaxconn=4096
+  - printf 'vm.swappiness=1\nnet.core.somaxconn=4096\n' > /etc/sysctl.d/90-crdb.conf
+  - touch /var/lib/cloud/instance/crdb-ready

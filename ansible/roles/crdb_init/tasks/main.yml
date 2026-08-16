@@ -1,0 +1,41 @@
+# One-time cluster bootstrap. Safe to re-run: `cockroach init` on an
+# initialized cluster exits with "cluster has already been initialized".
+---
+- name: Initialize cluster (first host only)
+  ansible.builtin.command:
+    cmd: >
+      /usr/local/bin/cockroach init
+      --certs-dir={{ crdb_certs_dir }}
+      --host={{ crdb_advertise }}:{{ crdb_sql_port }}
+  register: _init
+  changed_when: _init.rc == 0
+  failed_when:
+    - _init.rc != 0
+    - "'already been initialized' not in (_init.stderr + _init.stdout)"
+
+- name: Wait for SQL to answer
+  ansible.builtin.command:
+    cmd: >
+      /usr/local/bin/cockroach sql
+      --certs-dir={{ crdb_certs_dir }}
+      --host={{ crdb_advertise }}:{{ crdb_sql_port }}
+      -e "SELECT 1"
+  register: _sql
+  retries: 30
+  delay: 2
+  until: _sql.rc == 0
+  changed_when: false
+
+- name: All nodes joined (count == inventory)
+  ansible.builtin.command:
+    cmd: >
+      /usr/local/bin/cockroach sql
+      --certs-dir={{ crdb_certs_dir }}
+      --host={{ crdb_advertise }}:{{ crdb_sql_port }}
+      --format=csv
+      -e "SELECT count(*) FROM crdb_internal.gossip_nodes WHERE is_live"
+  register: _live
+  retries: 30
+  delay: 2
+  until: _live.stdout_lines | last | int == groups['crdb'] | length
+  changed_when: false

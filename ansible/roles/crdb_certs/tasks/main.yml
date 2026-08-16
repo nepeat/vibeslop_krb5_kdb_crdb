@@ -1,0 +1,58 @@
+# Controller-local certificate authority + per-node/client certs.
+# Runs once on localhost. Uses the pinned cockroach binary itself (via
+# `cockroach cert`) so cert layout always matches what CRDB expects.
+---
+- name: Create controller-side dirs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  loop:
+    - "{{ crdb_local_secrets }}"
+    - "{{ crdb_local_cache }}"
+
+- name: Fetch pinned cockroach tarball (controller)
+  ansible.builtin.get_url:
+    url: "https://binaries.cockroachdb.com/cockroach-v{{ crdb_version }}.{{ crdb_local_arch }}.tgz"
+    dest: "{{ crdb_local_cache }}/cockroach-v{{ crdb_version }}.{{ crdb_local_arch }}.tgz"
+    checksum: "{{ ('sha256:' + crdb_checksum) if crdb_checksum else omit }}"
+    mode: "0644"
+
+- name: Unpack cockroach binary (controller)
+  ansible.builtin.unarchive:
+    src: "{{ crdb_local_cache }}/cockroach-v{{ crdb_version }}.{{ crdb_local_arch }}.tgz"
+    dest: "{{ crdb_local_cache }}"
+    creates: "{{ crdb_local_cache }}/cockroach-v{{ crdb_version }}.{{ crdb_local_arch }}/cockroach"
+
+- name: Set controller cockroach path
+  ansible.builtin.set_fact:
+    crdb_local_bin: "{{ crdb_local_cache }}/cockroach-v{{ crdb_version }}.{{ crdb_local_arch }}/cockroach"
+
+- name: Create CA (once — guard the CA key with your life)
+  ansible.builtin.command:
+    cmd: >
+      {{ crdb_local_bin }} cert create-ca
+      --certs-dir={{ crdb_local_secrets }}
+      --ca-key={{ crdb_local_secrets }}/ca.key
+    creates: "{{ crdb_local_secrets }}/ca.crt"
+
+# `cockroach cert create-node` always writes node.crt/node.key, so each
+# host's cert must be created AND stashed under a per-host name before
+# the next host's run — hence the per-host include instead of a plain
+# loop (which would clobber every cert but the last).
+- name: Create + stash per-node certs
+  ansible.builtin.include_tasks: node_cert.yml
+  loop: "{{ groups['crdb'] }}"
+  loop_control:
+    loop_var: crdb_cert_host
+
+- name: Create client certs (root for ops, krb5kdc for the KDC plugin)
+  ansible.builtin.command:
+    cmd: >
+      {{ crdb_local_bin }} cert create-client {{ item }}
+      --certs-dir={{ crdb_local_secrets }}
+      --ca-key={{ crdb_local_secrets }}/ca.key
+    creates: "{{ crdb_local_secrets }}/client.{{ item }}.crt"
+  loop:
+    - root
+    - "{{ crdb_krb5_user }}"

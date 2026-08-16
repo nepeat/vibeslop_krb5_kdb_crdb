@@ -1,0 +1,40 @@
+# Controller-only smoke test: render everything derived from the
+# inventory (join list, locality, schema DDL) without touching hosts.
+#
+#   ansible-playbook -i inventory/example/hosts.ini render-test.yml
+---
+- name: Render inventory-derived config (no remote connections)
+  hosts: crdb
+  gather_facts: false
+  connection: local
+  vars_files:
+    - roles/crdb_node/defaults/main.yml
+  tasks:
+    - name: Show join list + locality (one host per region)
+      ansible.builtin.debug:
+        msg:
+          - "host={{ inventory_hostname }} locality=region={{ crdb_region }},zone={{ crdb_zone }}"
+          - "advertise={{ crdb_advertise }}:{{ crdb_sql_port }}"
+          - "join={{ crdb_join_list }}"
+      run_once: true
+
+    - name: Render schema DDL to /tmp/krb5-schema-render.sql
+      ansible.builtin.template:
+        src: roles/crdb_schema/templates/schema.sql.j2
+        dest: /tmp/krb5-schema-render.sql
+        mode: "0644"
+      vars:
+        _regions: >-
+          {{ groups['crdb'] | map('extract', hostvars, 'crdb_region')
+             | unique | list }}
+        _primary: "{{ crdb_primary_region if crdb_primary_region else (groups['crdb'] | map('extract', hostvars, 'crdb_region') | unique | list | first) }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Render systemd unit to /tmp/cockroach-render.service
+      ansible.builtin.template:
+        src: roles/crdb_node/templates/cockroach.service.j2
+        dest: /tmp/cockroach-render.service
+        mode: "0644"
+      run_once: true
+      delegate_to: localhost
