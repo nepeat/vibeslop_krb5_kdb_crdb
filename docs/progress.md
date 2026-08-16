@@ -1061,6 +1061,40 @@ decision if someone wants full-realm cold-start coverage. (3) kadmind
 still cannot start during an outage (no offline cache for admin roles) —
 intended, documented, not revisited.
 
+## 2026-08-16: PLAN — opt-in kprop/iprop replica mode (docs/kprop-receiver-plan.md)
+
+User asked: can the CRDB cluster be a kprop receiver of an external
+krb5 primary, taking kiprop incremental updates between full dumps —
+as an explicitly-enabled opt-in, since it's cluster-wide dangerous?
+Answer recorded in the new plan doc: not today (the temporary-db guard
+and `load -i` refusal from the safeguards session block it before any
+write, on purpose), but mechanically feasible — full prop is
+create(temporary)→puts→promote_db and iprop replay is plain vtable
+put/delete from kpropd, all slots we already implement.
+
+Design (see docs/kprop-receiver-plan.md for the full thing):
+- Triple gate, all required: `prop_receiver=off|kprop|iprop` knob +
+  operator-SQL `prop_control` marker row + dedicated `krb5prop` SQL
+  identity that alone can write staging. Default-off path must stay
+  bit-identical to today (existing e2e negative test kept).
+- Loads stream into REGIONAL staging tables (live GLOBAL tables
+  untouched until promote; staging avoids the commit-wait);
+  promote_db = leased, batched diff-sync (upserts then deletes) —
+  deliberately NOT one atomic flip (intent-set size at 262k rows);
+  mixed-version window ≈ what iprop incrementals produce anyway.
+- Replica write-freeze: marker on ⇒ kadmind writes refused (local
+  writes would be silently lost at next resync). iprop MASTER stays
+  unsupported; lease enforces exactly one receiver.
+- Phases: 0 spike (verify load db_args/ServerType/ulog against MIT
+  1.22.2), 1 schema+gates, 2 staging store+promote, 3
+  e2e/kprop-replica.sh (db2 primary on-box, full prop, liveness
+  during load, incrementals, forced resync, gate matrix, aborted
+  load), 4 README/runbooks.
+
+Open questions for user in the doc: write-freeze default, staging
+region templating, primary-in-compose vs on-box for the e2e. Nothing
+implemented yet — next concrete step is Phase 0.
+
 ## 2026-08-16: measured — what the entry cache is worth (user asked)
 
 A/B/A/B on the compose e2e realm (-w 16, 64 threads, 32k TGS-REQs over
