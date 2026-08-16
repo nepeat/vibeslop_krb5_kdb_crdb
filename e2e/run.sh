@@ -275,5 +275,21 @@ kinit -kt "$STATE/stress.keytab" host/h0000.example.com
 kdestroy
 echo "OK"
 
+say "safety: kprop-style full load is refused (temporary-db guard)"
+# A misdeployed kprop/kpropd runs plain `kdb5_util load`, which would
+# stream a dump over the LIVE GLOBAL tables. The plugin rejects the
+# "temporary" open before any write; the iprop full-resync (-i) path
+# dies the same way, so an iprop replica can never reach incremental
+# replay either. Only `load -update` (documented restore) is allowed.
+kdb5_util -r "$REALM" dump "$STATE/guard.dump"
+if kdb5_util -r "$REALM" load "$STATE/guard.dump" 2>/dev/null; then
+    echo "FAIL: plain kdb5_util load was ACCEPTED" >&2; exit 1
+fi
+n_before=$(wc -l < "$STATE/guard.dump")
+kdb5_util -r "$REALM" dump "$STATE/guard2.dump"
+n_after=$(wc -l < "$STATE/guard2.dump")
+[ "$n_before" = "$n_after" ] || { echo "FAIL: refused load mutated data ($n_before -> $n_after)" >&2; exit 1; }
+echo "OK (load refused, $n_after records intact)"
+
 say "PASS: kadmin, ktadd, kinit, stress ($STRESS_N users + $STRESS_N hosts), backend validation all green on CRDB"
 echo "QPS history: $QPS_LOG"

@@ -687,3 +687,39 @@ Known seam: kadmin's client-side timeout means "refused" during a
 partition can still commit later (standard exactly-once-ack problem);
 operators should treat timed-out kadmin writes as indeterminate and
 re-check with getprinc, not blind-retry addprinc -pw.
+
+## 2026-08-16: multi-kadmind partition semantics + kprop/kiprop safeguards
+
+**Q: multiple kadminds, one on a split R/O partition?** Answered with
+suite phase 4b+4c (kadmin-safety-test.sh, now 28 asserts, 28/28 PASS):
+a second kadmind pinned to a single CRDB gateway, that gateway cut from
+its peers both ways. Results: the minority-gateway kadmind FAILS CLOSED
+— refuses admin reads (stale/follower fallback is deliberately
+KDC-role-only; admin decisions never see stale data) and never acks
+writes. The multi-host kadmind keeps writing throughout (gateway
+failover), and both agree after heal. The one seam is the known
+exactly-once-ack gap: a client-side-timed-out write can commit after
+heal (observed again; row always fully formed). Multi-kadmind is safe
+by construction — one strongly-consistent DB, no state to diverge —
+the partitioned one just goes unavailable.
+
+**Q: safeguards against misdeployed kprop/kiprop?** Verified live on
+the compose cluster (2,056-record realm, byte-identical after all
+attempts): plain `kdb5_util load` (= what kpropd runs on a full prop)
+is refused EINVAL at open by the existing temporary-db guard, before
+any write; `load -i` refused even with iprop_enable=true, so an iprop
+replica can NEVER complete the initial full resync and therefore never
+reaches incremental ulog replay against CRDB; an iprop master kadmind
+aborts at startup. Only `kdb5_util load -update` (the documented
+restore path) is accepted — gated by the same client cert + stash as
+kadmind itself. e2e/run.sh now pins this with a negative test (load
+refused + record count unchanged).
+
+Chaos-tooling landmines found on sea1 (all encoded as comments in the
+suite): the CNI silently ignores per-pod
+statefulset.kubernetes.io/pod-name selectors (identity label filter —
+use custom labels); egress policies are not enforced (two-sided cuts
+need ingress rules on BOTH sides); established flows outlive new
+policies by ~30-50s (poll peer dials for enforcement, don't sleep);
+and rapid label/policy churn leaves stale state (apply one partition
+per run). kadmin -q exit codes are not acks — only reply text is.

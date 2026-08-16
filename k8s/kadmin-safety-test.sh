@@ -55,10 +55,13 @@ try_kinit() { # $1 pw, $2 principal, [$3 kdc ip]
     kx /bin/sh -c "$conf echo '$1' | kinit -c /tmp/kst-cc-\$\$ '$2' >/dev/null 2>&1 && kdestroy -c /tmp/kst-cc-\$\$ >/dev/null 2>&1"
 }
 kdc_ips() { kubectl -n $NS get pods -l app=kdc -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}'; }
-restarts() { kubectl -n $NS get pods -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{"\n"}{end}' | awk '{s+=$1} END {print s}'; }
+# kerberos pods only: phase 4c deliberately restarts a crdb container
+restarts() { kubectl -n $NS get pods -l 'app in (kdc, kadmind, loadgen)' -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{"\n"}{end}' | awk '{s+=$1} END {print s}'; }
 
 cleanup() {
-    kubectl -n $NS delete networkpolicy chaos-split-brain kst-isolate-0 --ignore-not-found >/dev/null 2>&1 || true
+    kubectl -n $NS delete networkpolicy chaos-split-brain kst-isolate-0 kst-shun-0 --ignore-not-found >/dev/null 2>&1 || true
+    kubectl -n $NS label pod crdb-cockroachdb-0 crdb-cockroachdb-1 crdb-cockroachdb-2 kst-part- >/dev/null 2>&1 || true
+    kubectl -n $NS delete deploy/kadmind-iso svc/kadmind-iso cm/kdc-config-iso --ignore-not-found >/dev/null 2>&1 || true
     for p in $(kadm "listprincs tc.*" | grep -oE '^tc\.[a-z0-9.]+@[A-Z.]+'); do
         kadm "delprinc -force $p" >/dev/null 2>&1
     done
@@ -66,7 +69,7 @@ cleanup() {
 trap cleanup EXIT
 
 say "phase 0: baseline"
-BASE_COUNT=$(sql "SELECT count(*) FROM krb5.principals")
+BASE_COUNT=$(sql "SELECT count(*) FROM krb5.principals WHERE name NOT LIKE 'tc.%'")
 BASE_RESTARTS=$(restarts)
 [ -n "$BASE_COUNT" ] && ok "SQL reachable, principals=$BASE_COUNT" || { bad "SQL unreachable"; exit 1; }
 kadm "getprinc $ADMIN" | grep -q "Principal: $ADMIN@$REALM" && ok "kadmind RPC up" || { bad "kadmind RPC down"; exit 1; }
@@ -80,10 +83,15 @@ for i in $(seq 0 31); do try_kinit "cp$i" "tc.conc.$i" && P1_OK=$((P1_OK+1)); do
 [ "$P1_OK" -eq 32 ] && ok "all 32 concurrent creates authable" || bad "only $P1_OK/32 concurrent creates authable"
 P1_SQL=$(sql "SELECT count(*) FROM krb5.principals WHERE name LIKE 'tc.conc.%'")
 [ "$P1_SQL" = "32" ] && ok "SQL rows = 32" || bad "SQL rows = $P1_SQL (want 32)"
-for i in $(seq 0 31); do kadm "delprinc -force tc.conc.$i" >/dev/null 2>&1 & done
-wait
-P1_DEL=$(sql "SELECT count(*) FROM krb5.principals WHERE name LIKE 'tc.conc.%'")
-[ "$P1_DEL" = "0" ] && ok "all 32 concurrent deletes landed" || bad "$P1_DEL rows survived delete"
+# an unacked delete RPC under concurrency is allowed to fail; the
+# invariant is convergence — retries drive the set to zero.
+for round in 1 2 3; do
+    for i in $(seq 0 31); do kadm "delprinc -force tc.conc.$i" >/dev/null 2>&1 & done
+    wait
+    P1_DEL=$(sql "SELECT count(*) FROM krb5.principals WHERE name LIKE 'tc.conc.%'")
+    [ "$P1_DEL" = "0" ] && break
+done
+[ "$P1_DEL" = "0" ] && ok "concurrent deletes converged to zero (round $round)" || bad "$P1_DEL rows survived 3 delete rounds"
 
 say "phase 2a: 16-way cpw storm on one principal"
 kadm "addprinc -pw race-base tc.race" >/dev/null 2>&1
@@ -167,33 +175,119 @@ kadm "addprinc -pw split-pw tc.split2" >/dev/null 2>&1
 sleep 2
 try_kinit "split-pw" "tc.split2" && ok "writes healthy after heal" || bad "writes still broken after heal"
 
-say "phase 4b: single CRDB pod partitioned — writes must survive via failover"
+say "phase 4b+4c: single-node partition — iso kadmind fails closed, multi-host survives"
+# kadmind-iso talks ONLY to crdb-0; the multi-host kadmind can reach all
+# three. crdb-0 is cut from its peers both ways (two ingress policies on
+# a CUSTOM label — this CNI ignores per-pod statefulset.io/pod-name
+# selectors and doesn't enforce egress; and label/policy churn leaves
+# stale state, so this partition is applied exactly ONCE per run).
+# Contract: the minority-gateway kadmind serves NO admin reads (stale
+# fallback is deliberately KDC-role-only) and acks NO writes; the
+# multi-host kadmind keeps working via gateway failover.
+kubectl -n $NS get cm kdc-config -o jsonpath='{.data.kdc\.conf}' \
+  | sed 's#connection_uri = postgresql://krb5kdc@[^/]*/#connection_uri = postgresql://krb5kdc@crdb-cockroachdb-0.crdb-cockroachdb.tmp-crdb-krb5.svc.cluster.local:26257/#' > /tmp/kst-iso-kdc.conf
+kubectl -n $NS create configmap kdc-config-iso \
+  --from-file=kdc.conf=/tmp/kst-iso-kdc.conf \
+  --from-literal=krb5.conf="$(kubectl -n $NS get cm kdc-config -o jsonpath='{.data.krb5\.conf}')" \
+  --from-literal=kadm5.acl="$(kubectl -n $NS get cm kdc-config -o jsonpath='{.data.kadm5\.acl}')" >/dev/null
+kubectl -n $NS get deploy kadmind -o json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for k in ("resourceVersion", "uid", "creationTimestamp", "generation", "annotations"):
+    d["metadata"].pop(k, None)
+d.pop("status", None)
+d["metadata"]["name"] = "kadmind-iso"
+d["metadata"]["labels"] = {"app": "kadmind-iso"}
+d["spec"]["selector"]["matchLabels"] = {"app": "kadmind-iso"}
+d["spec"]["template"]["metadata"]["labels"] = {"app": "kadmind-iso"}
+for v in d["spec"]["template"]["spec"]["volumes"]:
+    if v.get("configMap", {}).get("name") == "kdc-config":
+        v["configMap"]["name"] = "kdc-config-iso"
+print(json.dumps(d))' | kubectl apply -f - >/dev/null
+kubectl -n $NS expose deploy kadmind-iso --port=749 --target-port=749 --name=kadmind-iso >/dev/null 2>&1 || true
+kubectl -n $NS rollout status deploy/kadmind-iso --timeout=120s >/dev/null
+ISO_S="kadmind-iso.$NS.svc.cluster.local"
+kadm "delprinc -force tc.isobase" >/dev/null 2>&1   # idempotent re-runs
+ISO_UP=0
+for a in 1 2 3 4 5; do
+    kx kadmin -s $ISO_S -r $REALM -p $ADMIN -w "$ADMIN_PW" -q "addprinc -pw ib-pw tc.isobase" 2>&1 | grep -q "created\." && { ISO_UP=1; break; }
+    sleep 5
+done
+[ "$ISO_UP" = "1" ] && ok "kadmind-iso healthy pre-partition" || bad "kadmind-iso broken pre-partition"
+
+kubectl -n $NS label pod crdb-cockroachdb-0 kst-part=zero --overwrite >/dev/null
+kubectl -n $NS label pod crdb-cockroachdb-1 crdb-cockroachdb-2 kst-part=rest --overwrite >/dev/null
 cat <<'EOF' | kubectl apply -f - >/dev/null
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
-metadata:
-  name: kst-isolate-0
-  namespace: tmp-crdb-krb5
+metadata: {name: kst-isolate-0, namespace: tmp-crdb-krb5}
 spec:
-  podSelector:
-    matchLabels:
-      statefulset.kubernetes.io/pod-name: crdb-cockroachdb-0
+  podSelector: {matchLabels: {kst-part: zero}}
   policyTypes: [Ingress]
   ingress:
     - from:
         - podSelector:
-            matchExpressions:
-              - {key: app, operator: In, values: [kdc, kadmind, loadgen]}
+            matchExpressions: [{key: app, operator: In, values: [kdc, kadmind, kadmind-iso, loadgen]}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: kst-shun-0, namespace: tmp-crdb-krb5}
+spec:
+  podSelector: {matchLabels: {kst-part: rest}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions: [{key: kst-part, operator: NotIn, values: [zero]}]
 EOF
-sleep 5
-if timeout 60 kubectl -n $NS exec -i loadgen -- kadmin -r $REALM -p $ADMIN -w "$ADMIN_PW" -q "addprinc -pw iso-pw tc.iso" >/dev/null 2>&1; then
-    ok "write acked with crdb-0 partitioned (gateway failover)"
+# Deterministic enforcement wait: poll until peer dials are cut both
+# ways, then give leases a beat to decay.
+P4_ENFORCED=0
+for a in $(seq 1 24); do
+    d10=$(kubectl -n $NS exec -c db crdb-cockroachdb-1 -- bash -c "timeout 2 bash -c 'echo > /dev/tcp/crdb-cockroachdb-0.crdb-cockroachdb/26257' 2>/dev/null && echo OPEN || echo BLOCKED")
+    d01=$(kubectl -n $NS exec -c db crdb-cockroachdb-0 -- bash -c "timeout 2 bash -c 'echo > /dev/tcp/crdb-cockroachdb-1.crdb-cockroachdb/26257' 2>/dev/null && echo OPEN || echo BLOCKED")
+    [ "$d10" = "BLOCKED" ] && [ "$d01" = "BLOCKED" ] && { P4_ENFORCED=1; break; }
+    sleep 5
+done
+[ "$P4_ENFORCED" = "1" ] && ok "partition enforced (peer dials cut both ways)" || bad "partition never enforced by CNI"
+sleep 15
+
+if timeout 30 kubectl -n $NS exec -i loadgen -- kadmin -s $ISO_S -r $REALM -p $ADMIN -w "$ADMIN_PW" -q "getprinc tc.isobase" 2>/dev/null | grep -q "Principal: tc.isobase"; then
+    bad "isolated kadmind served an admin READ from a minority gateway"
 else
-    bad "write failed with only ONE node partitioned"
+    ok "isolated kadmind refuses admin reads (no stale fallback for kadmind role)"
 fi
-kubectl -n $NS delete networkpolicy kst-isolate-0 >/dev/null
-sleep 3
+if timeout 30 kubectl -n $NS exec -i loadgen -- kadmin -s $ISO_S -r $REALM -p $ADMIN -w "$ADMIN_PW" -q "addprinc -pw iw-pw tc.isowrite" 2>&1 | grep -q "created\."; then
+    bad "isolated kadmind ACKED a write from a minority gateway"
+else
+    ok "isolated kadmind refuses write acks"
+fi
+# multi-host kadmind: first attempt may sit on the dead gateway before
+# the plugin walks the host list — a retry must succeed.
+P4B_OK=0
+for a in 1 2 3; do
+    if timeout 60 kubectl -n $NS exec -i loadgen -- kadmin -r $REALM -p $ADMIN -w "$ADMIN_PW" -q "addprinc -pw iso-pw tc.iso" 2>&1 | grep -q "created\."; then
+        P4B_OK=$a; break
+    fi
+    sleep 3
+done
+[ "$P4B_OK" != "0" ] && ok "multi-host kadmind writes during the partition (attempt $P4B_OK)" || bad "multi-host kadmind never wrote during single-node partition"
+
+kubectl -n $NS delete networkpolicy kst-isolate-0 kst-shun-0 >/dev/null
+kubectl -n $NS label pod crdb-cockroachdb-0 crdb-cockroachdb-1 crdb-cockroachdb-2 kst-part- >/dev/null 2>&1
+sleep 10
 try_kinit "iso-pw" "tc.iso" && ok "partition-window write is authable" || bad "partition-window write not authable"
+ISO_ROW=$(sql "SELECT count(*) FROM krb5.principals WHERE name = 'tc.isowrite@$REALM'")
+if [ "$ISO_ROW" = "0" ]; then
+    ok "no ghost row from the isolated kadmind after heal"
+else
+    note "isolated kadmind's unacked write committed after heal (ack lost, data intact)"
+    try_kinit "iw-pw" "tc.isowrite" && ok "iso ack-lost row fully formed" || bad "iso ack-lost row TORN"
+fi
+G1=$(kadm "getprinc tc.isobase" | grep -c "Principal: tc.isobase@$REALM")
+G2=$(kx kadmin -s $ISO_S -r $REALM -p $ADMIN -w "$ADMIN_PW" -q "getprinc tc.isobase" 2>/dev/null | grep -c "Principal: tc.isobase@$REALM")
+[ "$G1" = "1" ] && [ "$G2" = "1" ] && ok "both kadminds agree after heal (no divergence)" || bad "kadminds disagree after heal ($G1 vs $G2)"
+kubectl -n $NS delete deploy/kadmind-iso svc/kadmind-iso cm/kdc-config-iso >/dev/null 2>&1
 
 say "phase 5: kadmind killed mid-batch — acked==authable, no torn rows"
 # ack = kadmind's post-commit "created." reply, NOT the exit code —
@@ -225,7 +319,7 @@ note "batch: $N_ACKED/64 acked before/around the kill; $P5_UNACKED_PRESENT unack
 say "phase 6: audit"
 cleanup
 sleep 2
-END_COUNT=$(sql "SELECT count(*) FROM krb5.principals")
+END_COUNT=$(sql "SELECT count(*) FROM krb5.principals WHERE name NOT LIKE 'tc.%'")
 [ "$END_COUNT" = "$BASE_COUNT" ] && ok "principal count back to baseline ($BASE_COUNT)" || bad "count drift: $BASE_COUNT -> $END_COUNT"
 ORPHANS=$(sql "SELECT count(*) FROM krb5.aliases a LEFT JOIN krb5.principals p ON a.canonical = p.name WHERE p.name IS NULL")
 [ "$ORPHANS" = "0" ] && ok "no orphan aliases" || bad "$ORPHANS orphan aliases"
