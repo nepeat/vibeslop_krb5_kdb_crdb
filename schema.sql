@@ -115,3 +115,6 @@ CREATE USER IF NOT EXISTS krb5prop;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE principals, policies,
     principals_staging, policies_staging TO krb5prop;
 GRANT SELECT, UPDATE ON TABLE prop_control TO krb5prop;
+-- SELECT only, like krb5kdc: every get_principal MISS falls through to
+-- the alias lookup, and kpropd's replay/load paths do existence checks.
+GRANT SELECT ON TABLE aliases TO krb5prop;

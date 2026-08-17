@@ -1822,7 +1822,8 @@ mod tests {
                  krb5proptest.principals_staging,
                  krb5proptest.policies_staging TO krb5prop;
              GRANT SELECT, UPDATE ON TABLE krb5proptest.prop_control
-                 TO krb5prop;",
+                 TO krb5prop;
+             GRANT SELECT ON TABLE krb5proptest.aliases TO krb5prop;",
         )
         .unwrap();
         let mut c = root_client();
