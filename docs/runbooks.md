@@ -324,3 +324,71 @@ stops all three nodes, restarts krb5kdc into the dead cluster, asserts
 auth works from the cache and that uncached lookups and writes fail with
 the right errors, ages the cache out, then heals and measures
 convergence.
+
+## 5. Migrate a realm from an external krb5 primary (kprop/iprop replica mode)
+
+Goal: replicate a production MIT realm (db2 or any KDB backend) into the
+CRDB cluster continuously, verify it, then cut over — or just bulk-load an
+exact copy for testing. `e2e/kprop-replica.sh` is the executable version
+of this runbook.
+
+### Enable (three keys, all required)
+
+1. Provision the `client.krb5prop` cert **on the kpropd host only** and
+   give that host its own `[dbmodules]` stanza:
+   `prop_receiver = iprop`, `connection_uri` with the krb5prop cert, plus
+   `iprop_enable = true`, `iprop_logfile`, `iprop_port` (required),
+   `iprop_replica_poll`. Keep the KDCs on their normal krb5kdc stanza —
+   they need none of this.
+2. Mark the cluster as a replica (operator SQL, root):
+   `UPSERT INTO prop_control (singleton, enabled, mode) VALUES (true, true, 'iprop');`
+   From this moment kadmind writes cluster-wide are refused (EPERM,
+   logged) — the propagation stream is the only writer. That is the
+   point: local writes would be silently destroyed at the next resync.
+3. Copy the **primary's** master key stash to the replica KDC/kpropd
+   hosts (the dump is ciphertext under the primary's K/M).
+
+On the primary: add `kiprop/<replica-fqdn>@REALM p` to kadm5.acl, create
+`host/<primary-fqdn>` + `kiprop/<replica-fqdn>` principals, keytab them,
+add `host/<primary-fqdn>@REALM` to the replica's kpropd.acl.
+
+### Bootstrap + steady state
+
+- Start kpropd on the receiver host, then push the first full dump from
+  the primary: `kdb5_util dump -i /tmp/full.dump && kprop -f /tmp/full.dump <replica-fqdn>`.
+  The load streams into the staging tables (live KDCs unaffected), then
+  promotes. Watch for the plugin's `promote complete:` stderr line;
+  `SELECT last_promote_at FROM prop_control` confirms.
+- Start the replica KDCs (or restart kpropd if it was polling before the
+  KDC came up — its kadm5-init backoff can otherwise sit for minutes).
+- Steady state: kpropd applies incrementals within the poll interval;
+  periodic full props diff-promote (unchanged rows are not rewritten).
+- Verify continuously: principal counts, and `kinit` of a known
+  principal against a replica KDC (proves key material end-to-end).
+
+### Cut over (promote-to-primary)
+
+1. Freeze changes on the old primary (stop kadmind or its clients).
+2. Push one final full dump; wait for `last_promote_at`.
+3. `UPDATE prop_control SET enabled = false;` — pushes are refused from
+   here on and the write-freeze lifts.
+4. Stop kpropd, point kadmin traffic at this cluster's kadmind, move
+   client krb5.conf/DNS to the new KDCs. The realm, including all key
+   material and kvnos, is byte-identical — issued tickets stay valid.
+
+### Recovery notes
+
+- **Lease stuck** (receiver died mid-load): it expires on its own (15
+  min), or clear it: `UPDATE prop_control SET lease_holder = NULL,
+  lease_expires = NULL;`. Aborted loads never touch live tables; the
+  next load clears staging itself.
+- **Replica ulog reset loop** ("Full resync needed" every poll): means
+  ulog_replay failed — check the kpropd host's stderr for `kdb_crdb:`
+  lines and CRDB grants (krb5prop needs SELECT on aliases too; a miss
+  during replay's existence check otherwise fails the whole update).
+- **kpropd under nix**: pass `-p $(command -v kdb5_util)` — the nixpkgs
+  krb5 build bakes a nonexistent lib/sbin path and kpropd logs
+  "completed" over the exec failure (silent no-op loads). The
+  kadmind-initiated automatic full resync has the same broken path baked
+  in with no override; trigger full props manually (cron on the primary)
+  if you need them under nix.

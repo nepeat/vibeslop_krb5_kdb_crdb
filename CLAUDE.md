@@ -69,6 +69,10 @@ concrete step. If it doesn't exist yet, create it.
   Patches still need to be sent upstream.
 - Dump-vs-restore round-trip CI test: deliberately excluded (user call,
   2026-08-16).
+- kprop/iprop replica mode (opt-in, triple-gated): DONE 2026-08-17 —
+  README "Running as a kprop/iprop replica", runbooks §5,
+  `e2e/kprop-replica.sh` (not in full-cycle; run it when touching the
+  receiver/staging/promote/freeze paths in lib.rs/store.rs).
 
 ## Working conventions
 

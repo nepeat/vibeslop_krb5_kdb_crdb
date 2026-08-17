@@ -1,9 +1,19 @@
 # Plan: CRDB cluster as a kprop/iprop replica of an external krb5 primary
 
-Status: PLAN — not implemented. Written 2026-08-16. Feature is a gated,
-opt-in reversal of the kprop/kiprop safeguards recorded in
-docs/progress.md (2026-08-16 "multi-kadmind partition semantics +
-kprop/kiprop safeguards").
+Status: **IMPLEMENTED 2026-08-17** — see README "Running as a
+kprop/iprop replica", docs/runbooks.md §5, and the 2026-08-17 progress
+entry. Kept for the design rationale; deltas from plan discovered during
+implementation: `iprop_port` is a required config once iprop_enable is
+on; krb5prop needs SELECT on aliases (miss-path lookups during replay);
+promote records no iprop serial (the ulog is client-side, set by
+`kdb5_util load -i` itself via ulog_set_last); the kadmind-initiated
+automatic full resync cannot run under nixpkgs krb5 (broken baked-in
+kprop path) — manual/cron full props instead. Phase E's kproplog -R
+variant was replaced by a manual re-push for the same reason.
+
+Original plan follows. Written 2026-08-16 as a gated, opt-in reversal of
+the kprop/kiprop safeguards recorded in docs/progress.md (2026-08-16
+"multi-kadmind partition semantics + kprop/kiprop safeguards").
 
 ## The question, answered
 

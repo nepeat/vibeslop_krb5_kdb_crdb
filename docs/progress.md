@@ -1141,3 +1141,84 @@ delegates); staging routing keys off the `temporary` db_arg; merge_nra
 accepted as no-op; promote_db re-opens, re-verifies marker+lease, then
 batched diff-promotes. Implementation next (schema → store/lib → tests
 → e2e rig with a db2 primary).
+
+## 2026-08-17: kprop/iprop replica mode IMPLEMENTED — full e2e green vs a real db2 primary
+
+Plan (docs/kprop-receiver-plan.md) executed end to end in one session:
+schema → gates/staging/promote/freeze in the plugin → 5 new cargo tests
+(38 total) → e2e/kprop-replica.sh with a REAL MIT db2 primary. Both
+target use cases work: bulk-loading an exact realm copy (real key
+material) and continuous replication for a production migration with a
+clean promote-to-primary cutover.
+
+**What landed** (commits 0b09fbf, 53ec4ac, cb199b5 + docs):
+- schema.sql: REGIONAL staging tables, prop_control singleton (operator
+  marker + single-receiver lease), krb5prop identity; compose roach-cert
+  emits client.krb5prop. Applied to the running cluster too.
+- store.rs: SqlSet table indirection (live vs staging, prepared-stmt
+  cache preserved), replica write-freeze (EPERM for non-receiver writes
+  while the marker is on; 42P01 = legacy schema = no freeze), lease
+  take/extend/steal-if-expired, paged clear_staging, and promote_staging
+  = leased batched diff-sync (upserts before deletes, unchanged rows
+  skipped, empty-staging refusal so a loadless promote can't wipe the
+  realm).
+- lib.rs: prop_receiver=off|kprop|iprop knob; open() routes a gated
+  `temporary` open into staging (marker+lease verified, EINVAL/EPERM/
+  EBUSY loud); merge_nra (load -i) requires iprop on knob AND marker;
+  non-KDC opens with knob+marker become freeze-exempt receivers (kpropd
+  incremental replay); promote_db re-opens its own store (static vtable
+  call) and re-derives the lease from a process-global id. Knob-off
+  behavior is bit-identical to before (regression-tested).
+
+**e2e/kprop-replica.sh** (all phases PASS, exit 0; not in full-cycle —
+run when touching receiver paths): db2 primary (krb5kdc+kadmind+iprop)
+on-box → gates refused knob-off/marker-less/foreign-lease before any
+write → bootstrap dump -i + kprop (527 principals live in 4s; 2,063 in
+14s at STRESS_N=2048) → replica KDC serves the realm with the PRIMARY's
+stash, password AND keytab kinit (key material byte-for-byte) → local
+kadmin writes frozen → iprop incrementals (addprinc/cpw/delprinc) inside
+the 2s poll → full re-push over the live realm (diff-promote; auth
+canary looped through it, zero failures) → marker off = pushes refused,
+freeze lifted. run.sh regression after: green, TGS 6971.9/s.
+
+**Bug the rig caught**: krb5prop had no SELECT on aliases, so any
+get_principal MISS through the receiver handle (addprinc existence
+check, ulog_replay pre-read) errored EIO — MIT's ulog_replay failure
+path then reset the replica ulog to sno=1 and kpropd spiraled into
+full-resync-forever. One-line grant fix (schema.sql + live + test env);
+diagnosing it required reading kdb_log.c (reset_ulog writes the dummy
+sno=1 entry we kept finding).
+
+**Environment traps recorded** (encoded as comments/flags in the rig):
+- nixpkgs krb5 bakes /nix/.../lib/sbin/{kdb5_util,kprop} (nonexistent —
+  split outputs) into kpropd and kadmind. kpropd: `-p $(command -v
+  kdb5_util)`; kpropd then logs "completed" OVER the exec failure, which
+  looks exactly like a silent no-op load. kadmind has no override → the
+  kadmind-initiated automatic full resync is untestable under nix
+  (manual/cron full props instead; receiver side is identical).
+- `iprop_port` is REQUIRED once iprop_enable=true ("Required parameters
+  in kdc.conf missing" otherwise, from kdb5_util create onwards).
+- kprop/kpropd canonicalize to the fqdn regardless of
+  dns_canonicalize_hostname=false; kpropd only accepts service tickets
+  for host/<its own fqdn>; kprop kinits against a live KDC (the primary
+  needs its krb5kdc running for propagation identities).
+- ktadd re-randomizes on every call: two per-side ktadds of the same
+  principal leave the first keytab dead. One shared prop keytab.
+- Stale-daemon hygiene: a zombie kpropd from a prior run holds the port
+  with dead keys and every port-liveness check lies. The rig pkills by
+  state-dir and polls ports free first. Daemon launches use inline env
+  (not shell function wrappers) so $! is the daemon, and write to files
+  so they can't hold the caller's stdout pipe open.
+
+**Numbers** (compose, lead override 25ms): bootstrap full push ~150
+rows/s end-to-end — bound by kdb5_util's serial one-row-per-round-trip
+puts into staging, NOT by promote (re-push of an unchanged realm: 4s,
+0 rows written). Headroom if bulk speed ever matters: buffer staged puts
+into multi-row statements. For read-bench fixtures at 262k scale,
+parallel kadmin.local with the override is still the faster loader
+(~1min vs ~30min); kprop wins on fidelity (byte-identical realm).
+
+Next: nothing blocking. Optional follow-ups: multi-row staging puts,
+wiring kprop-replica.sh into full-cycle behind a flag, k8s/ansible
+schema variants for the new tables/grants, and the standing kurbu5
+patch upstreaming.

@@ -188,6 +188,65 @@ database). Entries past the max age are refused rather than served. And a
 cache that answered misses with NOENTRY could tell a client that a
 principal which exists does not.
 
+## Running as a kprop/iprop replica (opt-in)
+
+The cluster can act as a **replica of an external MIT krb5 primary**
+(db2/LDAP/whatever): full `kprop` dumps land atomically-enough via staging
+tables, and `kpropd`'s iprop polling applies incremental updates between
+them. Main use cases: **migrating a production realm onto this backend**
+(replicate continuously, verify, then cut over) and **bulk-loading an
+exact copy of a realm for testing** (a dump load carries the real key
+material, unlike re-creating principals with kadmin).
+
+This is the single most dangerous thing the plugin can do — a full prop
+**replaces the entire realm, cluster-wide, in every region** — so it is
+gated behind three independent keys, all required:
+
+1. `prop_receiver = kprop|iprop` in the receiver host's `[dbmodules]`
+   stanza (default `off`; `iprop` also covers plain kprop loads).
+2. The operator marker row, created only by explicit SQL:
+   `UPSERT INTO prop_control (singleton, enabled, mode) VALUES (true, true, 'iprop');`
+3. The `krb5prop` SQL identity (client cert) — the only user with DML on
+   the staging tables. Provision it solely on the kpropd host.
+
+With any key missing, `kdb5_util load` is refused **before the first
+write** (the historic EINVAL behavior is bit-identical when the knob is
+off). Mechanics, verified against MIT 1.22.2 end-to-end
+(`e2e/kprop-replica.sh`):
+
+- A gated load streams the dump into `principals_staging`/
+  `policies_staging` (REGIONAL — no GLOBAL commit-wait per record; the
+  live tables serve every KDC untouched throughout). `promote_db` then
+  **diff-syncs**: batched upserts of new/changed rows first, deletes of
+  absent rows last — a KDC mid-promote sees old-or-new entries, never a
+  hole, and a routine re-prop where almost nothing changed writes almost
+  nothing. Deliberately *not* one atomic flip (a realm-sized txn is a
+  multi-hundred-MB intent set); the bounded old-or-new window matches
+  what iprop incrementals produce anyway.
+- A single-receiver **lease** in `prop_control` makes concurrent kpropds
+  structurally impossible; an aborted load leaves live data untouched
+  and the next load clears staging first.
+- **Write-freeze**: while the marker is enabled, kadmind/kdb5_util
+  writes from everyone except the receiver are refused (EPERM) — a
+  replica realm is read-only outside the propagation stream, because any
+  local write would be silently destroyed by the next full resync.
+  Promote-to-primary = `UPDATE prop_control SET enabled = false` (drops
+  the freeze, pushes start being refused again).
+- The replica KDC needs the **primary's master key stash** — the dump is
+  ciphertext under the primary's K/M, byte-for-byte.
+- iprop notes: `iprop_port` is required on both sides once
+  `iprop_enable = true`; the replica ulog is a local file managed by
+  libkdb5 (no backend involvement); MIT does not propagate policy
+  *changes* incrementally (full props carry policies). Being an iprop
+  **master** stays unsupported — this cluster is the end of the chain,
+  it is already its own multi-region replication.
+
+Measured on the compose cluster: 527-principal bootstrap push in 4 s
+end-to-end; 2,063 in 14 s (~150/s — bound by kdb5_util's serial per-row
+round-trips into staging, not by promote); re-push over a live realm in
+4 s with an auth canary looping through it, zero failures; incremental
+addprinc/cpw/delprinc visible on the replica within the 2 s poll.
+
 ## Known gaps / TODO
 
 - ~~TLS is stubbed~~ Fixed: TLS with chain + hostname verification is the
