@@ -15,7 +15,7 @@
 //! transaction inside the same loop.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -198,11 +198,10 @@ pub struct Store {
     offline: Option<OfflineCache>,
     /// Which table set this handle addresses (live vs staging).
     sql: &'static SqlSet,
-    /// See StoreOpts::staging / StoreOpts::receiver. `receiver` is
-    /// atomic because lib.rs flips it after open once the prop_control
-    /// marker has been verified (the store must exist to check it).
+    /// See StoreOpts::staging / StoreOpts::receiver. Both are fixed at
+    /// open from host config — nothing flips them at runtime.
     staging: bool,
-    receiver: AtomicBool,
+    receiver: bool,
     /// Staged puts since open; every LEASE_EXTEND_EVERY of them extends
     /// the receiver lease so a huge dump cannot outlive it mid-load.
     staged_puts: AtomicU64,
@@ -456,7 +455,7 @@ impl Store {
             offline: opts.offline,
             sql: if opts.staging { &STAGING_SQL } else { &LIVE_SQL },
             staging: opts.staging,
-            receiver: AtomicBool::new(opts.receiver),
+            receiver: opts.receiver,
             staged_puts: AtomicU64::new(0),
         })
     }
@@ -945,20 +944,13 @@ impl Store {
     // promote. The krb5prop SQL identity is enforced by grants, not code —
     // a handle connected as krb5kdc simply cannot write staging tables.
 
-    /// Mark this handle as the verified receiver (freeze-exempt). Called
-    /// by lib.rs after the prop_control marker has been checked — the
-    /// store must exist before the marker can be read.
-    pub fn set_receiver(&self) {
-        self.receiver.store(true, Ordering::Relaxed);
-    }
-
     /// The replica write-freeze. While the operator marker is enabled,
     /// live-table writes are refused for everyone but the receiver: a
     /// replica realm is read-only outside the propagation stream, and a
     /// local write would be silently destroyed by the next full resync.
     /// A missing prop_control table (pre-replica schema) means no freeze.
     fn ensure_writes_allowed(&self) -> Result<(), KdbError> {
-        if self.staging || self.receiver.load(Ordering::Relaxed) {
+        if self.staging || self.receiver {
             return Ok(());
         }
         let frozen = self.with_retry(|c| {
@@ -1007,16 +999,19 @@ impl Store {
     }
 
     /// Take (or re-take/steal-if-expired) the single-receiver lease.
-    /// One statement, so two racing kpropds cannot both win.
+    /// One statement, so two racing kpropds cannot both win. The lease
+    /// lives in its own table (see schema.sql) so holding it never
+    /// implies the right to touch the marker.
     pub fn take_prop_lease(&self) -> Result<(), KdbError> {
         let holder = lease_holder_id();
         let took = self.with_retry(|c| {
             c.client.execute(
                 &format!(
-                    "UPDATE prop_control SET lease_holder = $1, \
-                     lease_expires = now() + interval '{LEASE_TTL}' \
-                     WHERE enabled AND (lease_holder IS NULL \
-                     OR lease_expires < now() OR lease_holder = $1)"
+                    "UPDATE prop_lease SET holder = $1, \
+                     expires = now() + interval '{LEASE_TTL}' \
+                     WHERE (holder IS NULL OR expires < now() \
+                     OR holder = $1) \
+                     AND EXISTS (SELECT 1 FROM prop_control WHERE enabled)"
                 ),
                 &[&holder],
             )
@@ -1036,9 +1031,9 @@ impl Store {
         let n = self.with_retry(|c| {
             c.client.execute(
                 &format!(
-                    "UPDATE prop_control SET lease_expires = now() + \
-                     interval '{LEASE_TTL}' WHERE lease_holder = $1 \
-                     AND enabled"
+                    "UPDATE prop_lease SET expires = now() + \
+                     interval '{LEASE_TTL}' WHERE holder = $1 \
+                     AND EXISTS (SELECT 1 FROM prop_control WHERE enabled)"
                 ),
                 &[&holder],
             )
@@ -1050,6 +1045,21 @@ impl Store {
             warn("receiver lease lost mid-load; aborting");
             return Err(KdbError::Custom(libc::EBUSY));
         }
+        Ok(())
+    }
+
+    /// Drop the lease without stamping a promote — the abort path
+    /// (`kdb5_util` destroys the temporary db when a load fails). Without
+    /// it every kpropd retry would hit EBUSY until the TTL lapsed.
+    pub fn release_prop_lease(&self) -> Result<(), KdbError> {
+        let holder = lease_holder_id();
+        self.with_retry(|c| {
+            c.client.execute(
+                "UPDATE prop_lease SET holder = NULL, expires = NULL \
+                 WHERE holder = $1",
+                &[&holder],
+            )
+        })?;
         Ok(())
     }
 
@@ -1082,8 +1092,9 @@ impl Store {
         let holder = lease_holder_id();
         let held = self.with_retry(|c| {
             let row = c.client.query_opt(
-                "SELECT 1 FROM prop_control WHERE enabled \
-                 AND lease_holder = $1 AND lease_expires > now()",
+                "SELECT 1 FROM prop_lease WHERE holder = $1 \
+                 AND expires > now() \
+                 AND EXISTS (SELECT 1 FROM prop_control WHERE enabled)",
                 &[&holder],
             )?;
             Ok(row.is_some())
@@ -1122,9 +1133,8 @@ impl Store {
         self.clear_staging()?;
         self.with_retry(|c| {
             c.client.execute(
-                "UPDATE prop_control SET lease_holder = NULL, \
-                 lease_expires = NULL, last_promote_at = now() \
-                 WHERE lease_holder = $1",
+                "UPDATE prop_lease SET holder = NULL, expires = NULL, \
+                 last_promote_at = now() WHERE holder = $1",
                 &[&holder],
             )
         })?;
@@ -1753,24 +1763,30 @@ mod tests {
         format!("{}/e2e/.certs", env!("CARGO_MANIFEST_DIR"))
     }
 
-    /// Raw root client for test setup/asserts (Store exposes no raw SQL,
-    /// on purpose).
-    fn root_client() -> Client {
+    /// Raw client for test setup/asserts (Store exposes no raw SQL, on
+    /// purpose) — also how we assert what a role's grants do NOT allow.
+    fn raw_client(user: &str, pw: &str) -> Client {
         let pem = std::fs::read(format!("{}/ca.crt", certs_dir())).unwrap();
         let connector = TlsConnector::builder()
             .add_root_certificate(Certificate::from_pem(&pem).unwrap())
             .build()
             .unwrap();
         Client::connect(
-            "postgresql://root:root-dev-pw@localhost:26257/krb5proptest\
-             ?sslmode=require",
+            &format!(
+                "postgresql://{user}:{pw}@localhost:26257/krb5proptest\
+                 ?sslmode=require"
+            ),
             MakeTlsConnector::new(connector),
         )
         .unwrap_or_else(|e| {
             panic!(
-                "cannot connect as root ({e}) — is the compose cluster up?"
+                "cannot connect as {user} ({e}) — is the compose cluster up?"
             )
         })
+    }
+
+    fn root_client() -> Client {
+        raw_client("root", "root-dev-pw")
     }
 
     fn prop_test_env() -> Client {
@@ -1809,9 +1825,14 @@ mod tests {
                  singleton BOOL NOT NULL PRIMARY KEY DEFAULT true
                      CHECK (singleton),
                  enabled BOOL NOT NULL,
-                 mode STRING NOT NULL CHECK (mode IN ('kprop','iprop')),
-                 lease_holder STRING, lease_expires TIMESTAMPTZ,
+                 mode STRING NOT NULL CHECK (mode IN ('kprop','iprop')));
+             CREATE TABLE IF NOT EXISTS krb5proptest.prop_lease (
+                 singleton BOOL NOT NULL PRIMARY KEY DEFAULT true
+                     CHECK (singleton),
+                 holder STRING, expires TIMESTAMPTZ,
                  last_promote_at TIMESTAMPTZ);
+             INSERT INTO krb5proptest.prop_lease (singleton) VALUES (true)
+                 ON CONFLICT DO NOTHING;
              GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
                  krb5proptest.principals, krb5proptest.policies
                  TO krb5kdc;
@@ -1821,7 +1842,9 @@ mod tests {
                  krb5proptest.principals, krb5proptest.policies,
                  krb5proptest.principals_staging,
                  krb5proptest.policies_staging TO krb5prop;
-             GRANT SELECT, UPDATE ON TABLE krb5proptest.prop_control
+             GRANT SELECT ON TABLE krb5proptest.prop_control TO krb5prop;
+             REVOKE UPDATE ON TABLE krb5proptest.prop_control FROM krb5prop;
+             GRANT SELECT, UPDATE ON TABLE krb5proptest.prop_lease
                  TO krb5prop;
              GRANT SELECT ON TABLE krb5proptest.aliases TO krb5prop;",
         )
@@ -1830,6 +1853,8 @@ mod tests {
         // Clean slate: marker absent, tables empty.
         c.batch_execute(
             "DELETE FROM prop_control WHERE true;
+             UPDATE prop_lease SET holder = NULL, expires = NULL,
+                 last_promote_at = NULL WHERE true;
              DELETE FROM principals WHERE true;
              DELETE FROM policies WHERE true;
              DELETE FROM principals_staging WHERE true;
@@ -1930,12 +1955,12 @@ mod tests {
         assert!(kdc.get_policy("polC@R").unwrap().is_none());
         assert_eq!(kdc.get_policy("polD@R").unwrap().unwrap(), b"new");
 
-        // Promote released the lease, stamped the marker, cleared staging.
+        // Promote released the lease, stamped it, cleared staging.
         let row = root
             .query_one(
-                "SELECT lease_holder IS NULL, last_promote_at IS NOT NULL, \
+                "SELECT holder IS NULL, last_promote_at IS NOT NULL, \
                  (SELECT count(*) FROM principals_staging) \
-                 FROM prop_control",
+                 FROM prop_lease",
                 &[],
             )
             .unwrap();
@@ -1998,8 +2023,8 @@ mod tests {
 
         // A live foreign lease refuses us…
         root.execute(
-            "UPDATE prop_control SET lease_holder = 'other-kpropd', \
-             lease_expires = now() + interval '1 hour' WHERE true",
+            "UPDATE prop_lease SET holder = 'other-kpropd', \
+             expires = now() + interval '1 hour' WHERE true",
             &[],
         )
         .unwrap();
@@ -2010,13 +2035,24 @@ mod tests {
         );
         // …an expired one is stolen…
         root.execute(
-            "UPDATE prop_control SET lease_expires = now() - \
+            "UPDATE prop_lease SET expires = now() - \
              interval '1 second' WHERE true",
             &[],
         )
         .unwrap();
         stage.take_prop_lease().unwrap();
         // …and re-taking our own lease is idempotent.
+        stage.take_prop_lease().unwrap();
+
+        // An aborted load (kdb5_util destroy on the temporary db) hands
+        // the lease straight back instead of parking it for the TTL.
+        stage.release_prop_lease().unwrap();
+        assert!(
+            root.query_one("SELECT holder IS NULL FROM prop_lease", &[])
+                .unwrap()
+                .get::<_, bool>(0),
+            "release_prop_lease left the lease held"
+        );
         stage.take_prop_lease().unwrap();
 
         // With the marker disabled the lease is unavailable entirely.
@@ -2074,9 +2110,25 @@ mod tests {
             imposter.put_principal("evil@R", b"x").is_err(),
             "krb5kdc identity must not be able to stage a load"
         );
-        // And it cannot take the lease either (prop_control UPDATE is
+        // And it cannot take the lease either (prop_lease UPDATE is
         // krb5prop/root only).
         assert!(imposter.take_prop_lease().is_err());
+
+        // The receiver identity is powerful but NOT self-exempting: it
+        // holds the lease, and cannot clear the marker that freezes the
+        // cluster. (Hence the lease's own table — CRDB has no
+        // column-level grants.)
+        let mut prop = raw_client("krb5prop", "krb5prop-dev-pw");
+        assert!(
+            prop.execute(
+                "UPDATE prop_control SET enabled = false WHERE true",
+                &[]
+            )
+            .is_err(),
+            "krb5prop must not be able to lift the replica write-freeze"
+        );
+        prop.execute("UPDATE prop_lease SET expires = now() WHERE true", &[])
+            .expect("krb5prop must still be able to write the lease");
         root.execute("DELETE FROM prop_control WHERE true", &[]).unwrap();
     }
 

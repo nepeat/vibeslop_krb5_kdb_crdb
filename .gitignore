@@ -9,6 +9,8 @@
 /k8s/.bootstrap/
 /e2e/.certs/
 /e2e/.state/
+# kprop rig: db2 KDB + master stash + keytabs + dumps, all key-bearing
+/e2e/.state-kprop/
 
 # terraform state carries IPs/resource ids; providers are re-fetched by init
 /terraform/aws/.terraform/
@@ -24,5 +26,7 @@
 
 # build & run artifacts
 /target
+# nix build symlink
+/result
 /ansible/.cache/
 /e2e/qps.log

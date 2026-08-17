@@ -203,7 +203,10 @@ This is the single most dangerous thing the plugin can do — a full prop
 gated behind three independent keys, all required:
 
 1. `prop_receiver = kprop|iprop` in the receiver host's `[dbmodules]`
-   stanza (default `off`; `iprop` also covers plain kprop loads).
+   stanza (default `off`; `iprop` also covers plain kprop loads). This
+   one knob is read from the profile **only** — `-x prop_receiver=...`
+   on a kadmin/kdb5_util command line is ignored, because it is what
+   binds replica powers to the receiver *host*.
 2. The operator marker row, created only by explicit SQL:
    `UPSERT INTO prop_control (singleton, enabled, mode) VALUES (true, true, 'iprop');`
 3. The `krb5prop` SQL identity (client cert) — the only user with DML on
@@ -223,9 +226,13 @@ off). Mechanics, verified against MIT 1.22.2 end-to-end
   nothing. Deliberately *not* one atomic flip (a realm-sized txn is a
   multi-hundred-MB intent set); the bounded old-or-new window matches
   what iprop incrementals produce anyway.
-- A single-receiver **lease** in `prop_control` makes concurrent kpropds
-  structurally impossible; an aborted load leaves live data untouched
-  and the next load clears staging first.
+- A single-receiver **lease** makes concurrent kpropds structurally
+  impossible. It lives in its own `prop_lease` table, not in
+  `prop_control`: CockroachDB has no column-level grants, so sharing a
+  table would hand the receiver identity `UPDATE` on the marker — i.e.
+  the ability to lift the freeze it is subject to. An aborted load
+  leaves live data untouched, releases the lease on the way out, and the
+  next load clears staging first.
 - **Write-freeze**: while the marker is enabled, kadmind/kdb5_util
   writes from everyone except the receiver are refused (EPERM) — a
   replica realm is read-only outside the propagation stream, because any

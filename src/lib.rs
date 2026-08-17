@@ -153,6 +153,12 @@ fn conf_ms(
 /// 1 of 3 — see the [dbmodules] docs and schema.sql's prop_control block).
 /// Off by default; `iprop` also covers plain kprop loads (an iprop full
 /// resync IS one).
+///
+/// Unlike every other knob this one is read from the `[dbmodules]` profile
+/// ONLY, never from `-x` db_args: it is what binds replica-mode powers
+/// (staging writes, exemption from the write-freeze) to the receiver HOST.
+/// Honouring `-x prop_receiver=iprop` would let anyone who can run
+/// `kadmin.local` self-exempt from the freeze and write the live tables.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PropMode {
     Off,
@@ -163,9 +169,8 @@ enum PropMode {
 fn prop_mode(
     ctx: &KdbContext<'_>,
     section: &str,
-    db_args: &[&str],
 ) -> Result<PropMode, KdbError> {
-    match conf(ctx, section, db_args, "prop_receiver").as_deref() {
+    match ctx.db_module_string(section, "prop_receiver").as_deref() {
         None | Some("off") => Ok(PropMode::Off),
         Some("kprop") => Ok(PropMode::Kprop),
         Some("iprop") => Ok(PropMode::Iprop),
@@ -262,7 +267,7 @@ impl KdbModule for CrdbKdb {
         // tables instead — that is how the cluster receives a kprop
         // dump from an external primary.
         let temporary = has_db_arg(db_args, "temporary");
-        let pmode = prop_mode(ctx, conf_section, db_args)?;
+        let pmode = prop_mode(ctx, conf_section)?;
         if temporary && pmode == PropMode::Off {
             return Err(KdbError::Custom(libc::EINVAL));
         }
@@ -334,27 +339,27 @@ impl KdbModule for CrdbKdb {
             }),
         };
 
+        // Receiver hosts (prop_receiver in the host's own profile,
+        // admin-side roles): this handle IS the propagation stream —
+        // exempt from the replica write-freeze so kpropd's iprop
+        // incremental applies land. Decided purely from host config, not
+        // from a marker read at open: the marker can be flipped on hours
+        // after kpropd started, and a latched-at-open exemption (or one
+        // lost to a transient DB error) leaves the receiver permanently
+        // EPERM until someone restarts it. When the marker is off there
+        // is no freeze to be exempt from, so this is a no-op then.
+        // KDC handles never write, and every handle WITHOUT the knob
+        // stays freeze-checked, so a stray kadmind cannot exempt itself.
         let store = Store::connect_opts(
             &uri,
             StoreOpts {
                 stale_ms,
                 startup_retry_ms,
                 offline,
+                receiver: pmode != PropMode::Off && !is_kdc,
                 ..StoreOpts::default()
             },
         )?;
-
-        // Receiver hosts (prop_receiver set, admin-side roles): if the
-        // operator marker is on, this handle is the propagation stream —
-        // exempt from the replica write-freeze so kpropd's iprop
-        // incremental applies land. KDC handles never write, and every
-        // handle WITHOUT the knob stays freeze-checked, so a stray
-        // kadmind elsewhere cannot exempt itself.
-        if pmode != PropMode::Off && !is_kdc {
-            if let Ok(Some((true, _))) = store.prop_marker() {
-                store.set_receiver();
-            }
-        }
 
         Ok(CrdbKdb { store, cache })
     }
@@ -389,15 +394,48 @@ impl KdbModule for CrdbKdb {
 
     // The plugin never issues DDL and never mass-deletes shared state: the
     // GLOBAL tables may be serving KDCs in every region, so `kdb5_util
-    // destroy` from one admin box must not vaporize the realm. No-op:
-    // removing data is the operator's job, via SQL (schema.sql's domain).
+    // destroy` from one admin box must not vaporize the realm. Removing
+    // live data is the operator's job, via SQL (schema.sql's domain).
+    //
+    // The one thing it DOES do is tear down a replica-mode temporary db:
+    // kdb5_util calls destroy(db_args + "temporary") when a load fails
+    // (dump.c load_db cleanup), and that is the only signal we get that
+    // the load aborted. Release the receiver lease and drop the partial
+    // staging rows, or kpropd's next retry sits on EBUSY until the TTL
+    // lapses. Best-effort: a failure here must not mask the load error.
     const SUPPORTS_DESTROY: bool = true;
 
     fn destroy(
-        _ctx: &KdbContext<'_>,
-        _conf_section: &str,
-        _db_args: &[&str],
+        ctx: &KdbContext<'_>,
+        conf_section: &str,
+        db_args: &[&str],
     ) -> Result<(), KdbError> {
+        let pmode = prop_mode(ctx, conf_section)?;
+        if pmode == PropMode::Off || !has_db_arg(db_args, "temporary") {
+            return Ok(());
+        }
+        let Some(uri) = db_args
+            .iter()
+            .find_map(|a| a.strip_prefix("dburl=").map(str::to_owned))
+            .or_else(|| ctx.db_module_string(conf_section, "connection_uri"))
+            .or_else(|| std::env::var("KDB_CRDB_URI").ok())
+        else {
+            return Ok(());
+        };
+        match Store::connect_opts(
+            &uri,
+            StoreOpts { staging: true, ..StoreOpts::default() },
+        ) {
+            Ok(store) => {
+                warn("replica load aborted: releasing lease, clearing staging");
+                let _ = store.release_prop_lease();
+                let _ = store.clear_staging();
+            }
+            Err(_) => warn(
+                "replica load aborted but the database is unreachable — \
+                 the receiver lease will expire on its own",
+            ),
+        }
         Ok(())
     }
 
@@ -415,7 +453,7 @@ impl KdbModule for CrdbKdb {
         conf_section: &str,
         db_args: &[&str],
     ) -> Result<(), KdbError> {
-        let pmode = prop_mode(ctx, conf_section, db_args)?;
+        let pmode = prop_mode(ctx, conf_section)?;
         if pmode == PropMode::Off || !has_db_arg(db_args, "temporary") {
             return Ok(());
         }

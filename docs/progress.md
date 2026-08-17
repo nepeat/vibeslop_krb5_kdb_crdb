@@ -1222,3 +1222,59 @@ Next: nothing blocking. Optional follow-ups: multi-row staging puts,
 wiring kprop-replica.sh into full-cycle behind a flag, k8s/ansible
 schema variants for the new tables/grants, and the standing kurbu5
 patch upstreaming.
+
+## 2026-08-17 (later): code-review fixes on replica mode — the -x hole, lease table split, abort release
+
+Six findings from `/code-review medium` on the replica-mode PR, all
+fixed. The two that mattered:
+
+- **`-x prop_receiver=iprop` self-exempted anyone from the write-freeze.**
+  The knob went through `conf()`, which reads db_args before the profile,
+  so `kadmin.local -x prop_receiver=iprop -q delprinc` on a replica with
+  ordinary krb5kdc credentials bypassed the freeze and wrote live GLOBAL
+  tables. `prop_mode()` now reads `[dbmodules]` ONLY — the knob is what
+  binds replica powers to the receiver *host*, so a command-line spelling
+  of it defeats the whole gate. e2e asserts both shapes (load and kadmin
+  write) stay refused.
+- **krb5prop could lift the freeze.** CockroachDB has no column-level
+  grants (verified: `GRANT UPDATE (col)` is a syntax error), so the
+  table-level UPDATE the receiver needs for the lease also let it do
+  `UPDATE prop_control SET enabled = false`. The lease moved to its own
+  `prop_lease` table (holder/expires/last_promote_at, seeded by
+  schema.sql); krb5prop gets SELECT on prop_control and SELECT+UPDATE on
+  prop_lease. schema.sql is self-migrating: creates+seeds the table,
+  `DROP COLUMN IF EXISTS` the old lease columns, revokes the old grant.
+  Applied to the compose cluster. New store test asserts krb5prop's
+  marker UPDATE errors while its lease UPDATE succeeds.
+
+The rest:
+
+- Receiver freeze-exemption was latched at open behind `if let Ok(...)`,
+  so one transient CRDB error at kpropd startup left the process
+  permanently EPERM. Now it's a plain `StoreOpts.receiver` computed from
+  host config (knob set + non-KDC role) — no marker read at open, no
+  error to swallow, and it survives a marker enabled after kpropd
+  started. `Store.receiver` is a plain bool again (no AtomicBool,
+  `set_receiver` gone).
+- Aborted loads left the lease held for the full 15-min TTL, so every
+  kpropd retry hit EBUSY. `destroy()` is no longer a blanket no-op: for
+  a replica-mode *temporary* db (kdb5_util calls destroy(db_args +
+  "temporary") from load_db's cleanup on failure — checked in 1.22.2
+  dump.c) it releases the lease and clears staging, best-effort. Plain
+  `kdb5_util destroy` is still a no-op. e2e feeds kpropd's loader a
+  truncated dump and asserts the next load runs immediately.
+- Phase F pushed to `127.0.0.1`, which kpropd rejects on ticket
+  principal anyway — the "pushes refused with the marker off" assertion
+  was vacuous. Now pushes to `$HOSTFQDN`; the refusal is the plugin's
+  (`load refused: prop_control.enabled is false` in kpropd.out).
+- `/e2e/.state-kprop/` and `/result` were committed by 56fc259 (db2 KDB,
+  master.stash, keytabs, key-bearing dumps). Gitignored, and — user's
+  call, the commit was never pushed — amended out of that commit rather
+  than deleted in a follow-up, so no key material enters public history.
+
+`cargo test` 38/38, `e2e/kprop-replica.sh` all phases green (full push
+527 principals in 4s, re-push 529 in 4s, auth never failed).
+
+Next: unchanged from above (multi-row staging puts, full-cycle wiring
+behind a flag, k8s/ansible schema variants — those now need `prop_lease`
+too, kurbu5 patch upstreaming).

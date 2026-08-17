@@ -23,7 +23,7 @@
 #
 # DESTRUCTIVE to the dev DB: truncates principals/policies/aliases and
 # replaces the realm with the primary's content (that is what a replica
-# IS). Also resets prop_control.
+# IS). Also resets prop_control/prop_lease.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -83,7 +83,7 @@ wait_for() { # <seconds> <desc> <cmd...>
 say "building plugin"
 cargo build
 
-say "resetting state ($STATE + CRDB realm tables + prop_control)"
+say "resetting state ($STATE + CRDB realm tables + prop_control/prop_lease)"
 # Kill stale daemons from a previous run FIRST: a zombie kpropd keeps the
 # port bound with old (since-rerandomized) keytab keys, and every auth
 # fails with "Service key not available" while the port check passes.
@@ -98,7 +98,7 @@ done
 rm -rf "$STATE"
 mkdir -p "$P" "$R" "$STATE/plugins/kdb"
 ln -s "$PWD/target/debug/libkdb_crdb.so" "$STATE/plugins/kdb/kdb_crdb.so"
-sql 'TRUNCATE principals, policies; TRUNCATE aliases; DELETE FROM principals_staging WHERE true; DELETE FROM policies_staging WHERE true; DELETE FROM prop_control WHERE true' \
+sql 'TRUNCATE principals, policies; TRUNCATE aliases; DELETE FROM principals_staging WHERE true; DELETE FROM policies_staging WHERE true; DELETE FROM prop_control WHERE true; UPDATE prop_lease SET holder = NULL, expires = NULL, last_promote_at = NULL WHERE true' \
     || fail "cannot reach CRDB — docker compose up -d"
 if [[ "${TRUE_LATENCY:-0}" != 1 ]]; then
     sql "SET CLUSTER SETTING kv.closed_timestamp.lead_for_global_reads_override = '25ms'" >/dev/null
@@ -312,6 +312,17 @@ fi
     fail "ungated load wrote rows"
 pass "knob-off load refused before any write"
 
+say "GATES: -x prop_receiver must NOT turn replica mode on (host-bound knob)"
+# The knob is read from the host's [dbmodules] profile only. Honouring it
+# from -x would let anyone who can run kdb5_util/kadmin.local self-grant
+# replica powers on a cluster whose KDC hosts never opted in.
+if rep kdb5_util -x prop_receiver=iprop load "$STATE/gate.dump" >/dev/null 2>&1; then
+    fail "-x prop_receiver=iprop enabled replica mode from a KDC profile"
+fi
+[[ $(sql 'SELECT count(*) FROM principals') == 0 ]] ||
+    fail "-x-gated load wrote rows"
+pass "-x prop_receiver ignored"
+
 say "GATES: gated load without the marker row must be refused (EPERM)"
 if prop kdb5_util load "$STATE/gate.dump" >/dev/null 2>&1; then
     fail "gated load accepted WITHOUT the prop_control marker"
@@ -322,12 +333,31 @@ say "GATES: enabling replica mode (operator marker, mode=iprop)"
 sql "UPSERT INTO prop_control (singleton, enabled, mode) VALUES (true, true, 'iprop')" >/dev/null
 
 say "GATES: foreign unexpired lease must refuse a load (EBUSY)"
-sql "UPDATE prop_control SET lease_holder = 'other-kpropd', lease_expires = now() + interval '1 hour' WHERE true" >/dev/null
+sql "UPDATE prop_lease SET holder = 'other-kpropd', expires = now() + interval '1 hour' WHERE true" >/dev/null
 if prop kdb5_util load "$STATE/gate.dump" >/dev/null 2>&1; then
     fail "load accepted despite a foreign receiver lease"
 fi
-sql "UPDATE prop_control SET lease_holder = NULL, lease_expires = NULL WHERE true" >/dev/null
+sql "UPDATE prop_lease SET holder = NULL, expires = NULL WHERE true" >/dev/null
 pass "foreign lease refused the load"
+
+say "GATES: an aborted load must hand the receiver lease straight back"
+# kdb5_util destroys the temporary db when a load fails; that is where the
+# plugin releases the lease. Without it every kpropd retry would sit on
+# EBUSY for the whole lease TTL.
+{ head -1 "$STATE/gate.dump"; sed -n '2p' "$STATE/gate.dump" | cut -c1-80; } \
+    >"$STATE/bad.dump"
+if prop kdb5_util load "$STATE/bad.dump" >/dev/null 2>&1; then
+    fail "a truncated dump loaded successfully"
+fi
+[[ $(sql 'SELECT count(*) FROM prop_lease WHERE holder IS NOT NULL') == 0 ]] ||
+    fail "aborted load left the receiver lease held"
+[[ $(sql 'SELECT count(*) FROM principals') == 0 ]] ||
+    fail "aborted load reached the live tables"
+prop kdb5_util load "$STATE/gate.dump" >/dev/null 2>&1 ||
+    fail "load refused right after an aborted one (stuck lease?)"
+sql 'TRUNCATE principals, policies' >/dev/null
+sql "UPDATE prop_lease SET holder = NULL, expires = NULL, last_promote_at = NULL WHERE true" >/dev/null
+pass "aborted load released the lease; the next load ran immediately"
 
 # ---------------------------------------------------------------------------
 start_kpropd() {
@@ -352,7 +382,7 @@ T0=$SECONDS
 KRB5_KTNAME="$STATE/prop.keytab" pri kprop -f "$STATE/full.dump" \
     -P "$KPROP_PORT" "$HOSTFQDN"
 wait_for 90 "promote to complete" bash -c \
-    "[[ \$(psql '$CRDB_URI_ROOT' -qtA -c 'SELECT count(*) FROM prop_control WHERE last_promote_at IS NOT NULL') == 1 ]]"
+    "[[ \$(psql '$CRDB_URI_ROOT' -qtA -c 'SELECT count(*) FROM prop_lease WHERE last_promote_at IS NOT NULL') == 1 ]]"
 T_FULL=$((SECONDS - T0))
 REPLICA_COUNT=$(sql 'SELECT count(*) FROM principals')
 [[ "$REPLICA_COUNT" == "$PRIMARY_COUNT" ]] ||
@@ -392,7 +422,15 @@ if rep kadmin.local -q "addprinc -pw x local-write-must-fail" 2>&1 | grep -qi "c
 fi
 [[ $(sql "SELECT count(*) FROM principals WHERE name LIKE 'local-write-must-fail%'") == 0 ]] ||
     fail "frozen write reached the database"
-pass "local writes frozen while replica mode is on"
+# …and a kadmin that claims to be the receiver on its command line is
+# still frozen: the exemption comes from the host's profile, not from -x.
+if rep kadmin.local -x prop_receiver=iprop \
+        -q "addprinc -pw x xarg-must-fail" 2>&1 | grep -qi "created"; then
+    fail "-x prop_receiver self-exempted a kadmin from the write-freeze"
+fi
+[[ $(sql "SELECT count(*) FROM principals WHERE name LIKE 'xarg-must-fail%'") == 0 ]] ||
+    fail "-x prop_receiver write reached the database"
+pass "local writes frozen while replica mode is on (-x cannot exempt)"
 
 say "PHASE D: iprop incrementals (poll ${POLL}s)"
 pri kadmin.local -q "addprinc -pw inc-bob-pw inc-bob" >/dev/null
@@ -437,13 +475,13 @@ say "PHASE E: full RE-push over the live realm, with auth liveness"
 ) &
 LIVENESS_PID=$!
 pri kadmin.local -q "addprinc -pw resync-pw resync-carol" >/dev/null
-PROMOTE_T_BEFORE=$(sql 'SELECT COALESCE(last_promote_at::string, '"''"') FROM prop_control')
+PROMOTE_T_BEFORE=$(sql 'SELECT COALESCE(last_promote_at::string, '"''"') FROM prop_lease')
 pri kdb5_util dump -i "$STATE/repush.dump" >/dev/null
 T0=$SECONDS
 KRB5_KTNAME="$STATE/prop.keytab" pri kprop -f "$STATE/repush.dump" \
     -P "$KPROP_PORT" "$HOSTFQDN"
 wait_for 90 "re-push promote" bash -c \
-    "[[ \$(psql '$CRDB_URI_ROOT' -qtA -c \"SELECT count(*) FROM prop_control WHERE last_promote_at IS NOT NULL AND last_promote_at::string != '$PROMOTE_T_BEFORE'\") == 1 ]]"
+    "[[ \$(psql '$CRDB_URI_ROOT' -qtA -c \"SELECT count(*) FROM prop_lease WHERE last_promote_at IS NOT NULL AND last_promote_at::string != '$PROMOTE_T_BEFORE'\") == 1 ]]"
 T_REPUSH=$((SECONDS - T0))
 kill "$LIVENESS_PID" 2>/dev/null || true; wait "$LIVENESS_PID" 2>/dev/null || true
 [[ ! -f "$STATE/liveness.failed" ]] ||
@@ -460,7 +498,7 @@ say "PHASE F: marker off -> pushes refused again, freeze lifted"
 sql "UPDATE prop_control SET enabled = false WHERE true" >/dev/null
 pri kdb5_util dump -i "$STATE/off.dump" >/dev/null
 if KRB5_KTNAME="$STATE/prop.keytab" pri kprop -f "$STATE/off.dump" \
-    -P "$KPROP_PORT" 127.0.0.1 >/dev/null 2>&1; then
+    -P "$KPROP_PORT" "$HOSTFQDN" >/dev/null 2>&1; then
     fail "kprop push succeeded with replica mode disabled"
 fi
 rep kadmin.local -q "addprinc -pw thaw-pw thaw-test" >/dev/null

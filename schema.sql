@@ -82,23 +82,40 @@ CREATE TABLE IF NOT EXISTS policies_staging (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 ) LOCALITY REGIONAL BY TABLE;
 
--- Replica-mode marker + receiver lease. The plugin never INSERTs here:
--- creating the row is the operator's explicit opt-in —
+-- Replica-mode marker. The plugin NEVER writes this table — creating the
+-- row is the operator's explicit opt-in, and only an operator can clear it:
 --   enable:  UPSERT INTO prop_control (singleton, enabled, mode)
 --            VALUES (true, true, 'iprop');
 --   disable (promote-to-primary): UPDATE prop_control SET enabled = false;
 -- mode 'iprop' also permits plain kprop loads; 'kprop' permits only those.
--- The lease makes "exactly one receiver" structural: open(temporary) takes
--- it, promote_db verifies and releases it, a second kpropd is refused.
 CREATE TABLE IF NOT EXISTS prop_control (
     singleton       BOOL        NOT NULL PRIMARY KEY DEFAULT true
                                 CHECK (singleton),
     enabled         BOOL        NOT NULL,
-    mode            STRING      NOT NULL CHECK (mode IN ('kprop', 'iprop')),
-    lease_holder    STRING,
-    lease_expires   TIMESTAMPTZ,
+    mode            STRING      NOT NULL CHECK (mode IN ('kprop', 'iprop'))
+) LOCALITY GLOBAL;
+
+-- The single-receiver lease, deliberately a SEPARATE table: CockroachDB has
+-- no column-level grants, and krb5prop must be able to write the lease
+-- without being able to write prop_control.enabled — otherwise the receiver
+-- identity could lift the cluster-wide write-freeze it is subject to.
+-- "Exactly one receiver" is structural: open(temporary) takes the lease,
+-- promote_db verifies and releases it, a second kpropd is refused. The row
+-- is seeded here (an empty lease is not an opt-in); the plugin only UPDATEs.
+CREATE TABLE IF NOT EXISTS prop_lease (
+    singleton       BOOL        NOT NULL PRIMARY KEY DEFAULT true
+                                CHECK (singleton),
+    holder          STRING,
+    expires         TIMESTAMPTZ,
     last_promote_at TIMESTAMPTZ
 ) LOCALITY GLOBAL;
+INSERT INTO prop_lease (singleton) VALUES (true) ON CONFLICT DO NOTHING;
+
+-- Upgrade from the first replica-mode schema, where the lease lived in
+-- prop_control (and krb5prop therefore held UPDATE on the marker itself).
+ALTER TABLE prop_control DROP COLUMN IF EXISTS lease_holder;
+ALTER TABLE prop_control DROP COLUMN IF EXISTS lease_expires;
+ALTER TABLE prop_control DROP COLUMN IF EXISTS last_promote_at;
 
 -- Least-privilege role for the KDC/kadmind:
 CREATE USER IF NOT EXISTS krb5kdc;
@@ -114,7 +131,10 @@ GRANT SELECT ON TABLE prop_control TO krb5kdc;  -- write-freeze check only
 CREATE USER IF NOT EXISTS krb5prop;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE principals, policies,
     principals_staging, policies_staging TO krb5prop;
-GRANT SELECT, UPDATE ON TABLE prop_control TO krb5prop;
+-- Marker: read-only, like every other role. Only the lease is writable.
+GRANT SELECT ON TABLE prop_control TO krb5prop;
+REVOKE UPDATE ON TABLE prop_control FROM krb5prop;  -- pre-prop_lease grant
+GRANT SELECT, UPDATE ON TABLE prop_lease TO krb5prop;
 -- SELECT only, like krb5kdc: every get_principal MISS falls through to
 -- the alias lookup, and kpropd's replay/load paths do existence checks.
 GRANT SELECT ON TABLE aliases TO krb5prop;

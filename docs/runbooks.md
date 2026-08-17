@@ -332,11 +332,24 @@ CRDB cluster continuously, verify it, then cut over — or just bulk-load an
 exact copy for testing. `e2e/kprop-replica.sh` is the executable version
 of this runbook.
 
+### Schema
+
+Re-apply `schema.sql` as root before enabling replica mode on a cluster
+that ran the first replica-mode schema (2026-08-17): the receiver lease
+moved out of `prop_control` into its own `prop_lease` table, so that
+`krb5prop` can hold the lease without holding `UPDATE` on the marker that
+freezes the cluster (CockroachDB has no column-level grants). The file is
+idempotent — it creates and seeds `prop_lease`, drops the old lease
+columns, and revokes the old grant. Any `last_promote_at` history is lost
+in the move; the marker row itself is untouched.
+
 ### Enable (three keys, all required)
 
 1. Provision the `client.krb5prop` cert **on the kpropd host only** and
    give that host its own `[dbmodules]` stanza:
-   `prop_receiver = iprop`, `connection_uri` with the krb5prop cert, plus
+   `prop_receiver = iprop` (profile only — `-x prop_receiver=` on a
+   command line is deliberately ignored), `connection_uri` with the
+   krb5prop cert, plus
    `iprop_enable = true`, `iprop_logfile`, `iprop_port` (required),
    `iprop_replica_poll`. Keep the KDCs on their normal krb5kdc stanza —
    they need none of this.
@@ -358,7 +371,7 @@ add `host/<primary-fqdn>@REALM` to the replica's kpropd.acl.
   the primary: `kdb5_util dump -i /tmp/full.dump && kprop -f /tmp/full.dump <replica-fqdn>`.
   The load streams into the staging tables (live KDCs unaffected), then
   promotes. Watch for the plugin's `promote complete:` stderr line;
-  `SELECT last_promote_at FROM prop_control` confirms.
+  `SELECT last_promote_at FROM prop_lease` confirms.
 - Start the replica KDCs (or restart kpropd if it was polling before the
   KDC came up — its kadm5-init backoff can otherwise sit for minutes).
 - Steady state: kpropd applies incrementals within the poll interval;
@@ -369,7 +382,7 @@ add `host/<primary-fqdn>@REALM` to the replica's kpropd.acl.
 ### Cut over (promote-to-primary)
 
 1. Freeze changes on the old primary (stop kadmind or its clients).
-2. Push one final full dump; wait for `last_promote_at`.
+2. Push one final full dump; wait for `last_promote_at` (`prop_lease`).
 3. `UPDATE prop_control SET enabled = false;` — pushes are refused from
    here on and the write-freeze lifts.
 4. Stop kpropd, point kadmin traffic at this cluster's kadmind, move
@@ -378,10 +391,12 @@ add `host/<primary-fqdn>@REALM` to the replica's kpropd.acl.
 
 ### Recovery notes
 
-- **Lease stuck** (receiver died mid-load): it expires on its own (15
-  min), or clear it: `UPDATE prop_control SET lease_holder = NULL,
-  lease_expires = NULL;`. Aborted loads never touch live tables; the
-  next load clears staging itself.
+- **Lease stuck**: a load that *fails* releases the lease itself (the
+  plugin hooks kdb5_util's destroy of the temporary db), so kpropd
+  retries immediately. Only a hard-killed receiver (SIGKILL, host loss)
+  leaves it held; it then expires on its own (15 min), or clear it:
+  `UPDATE prop_lease SET holder = NULL, expires = NULL;`. Aborted loads
+  never touch live tables; the next load clears staging itself.
 - **Replica ulog reset loop** ("Full resync needed" every poll): means
   ulog_replay failed — check the kpropd host's stderr for `kdb_crdb:`
   lines and CRDB grants (krb5prop needs SELECT on aliases too; a miss
